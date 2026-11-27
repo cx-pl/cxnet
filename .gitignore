@@ -1,0 +1,13 @@
+/.obj/
+/.bin/
+
+**/.obj/
+**/.bin/
+**/.dist/
+**/.packages/
+.build/
+**/.build-*/
+
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]

@@ -1,0 +1,9 @@
+name: RestCancellationFixture
+version: 0.1.0
+type: Executable
+project_references:
+- ../../src/cxnet.cxproj
+generators:
+- id: cxnet-rest
+  executable: ../../generators/rest/.bin/Release/CxnetRestGenerator.exe
+  timeout_seconds: 600

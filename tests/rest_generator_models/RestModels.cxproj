@@ -1,0 +1,6 @@
+name: RestModels
+type: Library
+version: 0.1.0
+project_references:
+- ../../../cxdata/src/cxdata.cxproj
+- ../../src/cxnet.cxproj

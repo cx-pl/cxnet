@@ -1,0 +1,7 @@
+import System;
+
+namespace System.Net;
+
+public abstract class EndPoint : Object {
+    public virtual AddressFamily AddressFamily { const get { return AddressFamily.Unspecified; } }
+}

@@ -1,0 +1,28 @@
+import System;
+import System.Reflection;
+
+namespace System.Net.Http.Rest;
+
+public final class RestSerializerRegistration<T> : IRestSerializerRegistration {
+    private TypeInfo _valueType;
+    private IRestSerializer<T> _serializer;
+    private string _contentType;
+
+    public TypeInfo ValueType { const get => _valueType; }
+    public string ContentType { const get => _contentType; }
+
+    public constructor(TypeInfo valueType, IRestSerializer<T> serializer,
+        string contentType) {
+        _valueType = valueType;
+        _serializer = serializer;
+        _contentType = contentType;
+    }
+
+    public string Serialize(object value, object options) {
+        return _serializer.Serialize((T)value, options);
+    }
+
+    public object Deserialize(string content, object options) {
+        return (object)_serializer.Deserialize(content, options);
+    }
+}

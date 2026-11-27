@@ -1,0 +1,8 @@
+import System;
+
+namespace System.Net.Http.Rest;
+
+@AnnotationUsage(targets = "class,function")
+public final class Authorize : Annotation {
+    public constructor(string scheme) {}
+}

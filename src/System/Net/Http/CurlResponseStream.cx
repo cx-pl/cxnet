@@ -1,0 +1,568 @@
+import System;
+import System.IO;
+import System.Threading;
+import System.Threading.Tasks;
+
+namespace System.Net.Http;
+
+// A bounded, async-first body stream fed by the curl multi-socket callbacks.
+// The native transfer pauses when this queue is full and resumes after reads.
+internal final class CurlResponseStream : Stream {
+    private const uint BufferCapacity = 65536u;
+    private CurlHttpRequestState _state;
+    private byte[] _buffer;
+    private uint _head;
+    private uint _count;
+    private Task<uint> _pendingRead;
+    private CancellationToken _pendingReadToken;
+    private byte[] _pendingDestination;
+    private uint _pendingOffset;
+    private uint _pendingCount;
+    private CancellationTokenRegistration _pendingReadCancellation;
+    private bool _finished;
+    private bool _cancelled;
+    private bool _disposed;
+    private Exception _error;
+    private CancellationTokenRegistration _cancellationRegistration;
+    private uint _bufferLimit;
+    private Mutex _stateMutex;
+
+    internal uint BufferLimit { const get => _bufferLimit; }
+
+    public override bool CanRead {
+        get {
+            _stateMutex.Lock();
+            try { return !_disposed; }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    public constructor(CurlHttpRequestState state, CancellationToken cancellationToken,
+        uint bufferLimit) {
+        _state = state;
+        _buffer = new byte[BufferCapacity];
+        _bufferLimit = bufferLimit;
+        _head = 0u;
+        _count = 0u;
+        _pendingRead = null;
+        _pendingReadToken = CancellationToken.None;
+        _pendingDestination = null;
+        _pendingOffset = 0u;
+        _pendingCount = 0u;
+        _pendingReadCancellation = CancellationTokenRegistration.None;
+        _finished = false;
+        _cancelled = false;
+        _disposed = false;
+        _error = null;
+        _stateMutex = new Mutex();
+        CurlResponseStream stream = this;
+        _cancellationRegistration = cancellationToken.Register(
+            () => stream.RequestCancellation());
+    }
+
+    internal bool CanAcceptChunk(uint length) {
+        _stateMutex.Lock();
+        try {
+            return !_disposed && !_finished &&
+                length <= BufferCapacity - _count;
+        } finally {
+            _stateMutex.Unlock();
+        }
+    }
+
+    internal void AcceptChunk(byte[] bytes) {
+        if (bytes == null) throw new ArgumentNullException("bytes");
+        if (bytes.Length == 0u) return;
+        uint offset = 0u;
+        uint completedCount = 0u;
+        Task<uint> completion = null;
+        bool completeCanceled = false;
+        CancellationTokenRegistration pendingCancellation =
+            CancellationTokenRegistration.None;
+        _stateMutex.Lock();
+        try {
+            if (_disposed || _finished) return;
+            if (_pendingRead != null) {
+                if (_pendingReadToken.IsCancellationRequested) {
+                    completion = _pendingRead;
+                    completeCanceled = true;
+                    pendingCancellation = ClearPendingRead();
+                } else {
+                    completedCount = _pendingCount < bytes.Length
+                        ? _pendingCount : bytes.Length;
+                    for (uint index = 0u; index < completedCount; index += 1u) {
+                        _pendingDestination[_pendingOffset + index] = bytes[index];
+                    }
+                    offset = completedCount;
+                    completion = _pendingRead;
+                    pendingCancellation = ClearPendingRead();
+                }
+            }
+            while (offset < bytes.Length) {
+                uint tail = (_head + _count) % BufferCapacity;
+                uint available = BufferCapacity - tail;
+                uint copied = bytes.Length - offset < available
+                    ? bytes.Length - offset : available;
+                for (uint index = 0u; index < copied; index += 1u) {
+                    _buffer[tail + index] = bytes[offset + index];
+                }
+                _count += copied;
+                offset += copied;
+            }
+        } finally {
+            _stateMutex.Unlock();
+        }
+        DisposeRegistration(pendingCancellation);
+        if (completion != null) {
+            if (completeCanceled) completion.SetCanceled();
+            else completion.SetResult(completedCount);
+        }
+    }
+
+    internal void Complete() {
+        Task<uint> completion = null;
+        bool completeCanceled = false;
+        CancellationTokenRegistration pendingCancellation =
+            CancellationTokenRegistration.None;
+        CancellationTokenRegistration cancellation =
+            CancellationTokenRegistration.None;
+        _stateMutex.Lock();
+        try {
+            if (_disposed || _finished) return;
+            _finished = true;
+            if (_pendingRead != null && _count == 0u) {
+                completion = _pendingRead;
+                completeCanceled = _pendingReadToken.IsCancellationRequested;
+                pendingCancellation = ClearPendingRead();
+            }
+            cancellation = _cancellationRegistration;
+            _cancellationRegistration = CancellationTokenRegistration.None;
+        } finally {
+            _stateMutex.Unlock();
+        }
+        DisposeRegistration(pendingCancellation);
+        DisposeRegistration(cancellation);
+        if (completion != null) {
+            if (completeCanceled) completion.SetCanceled();
+            else completion.SetResult(0u);
+        }
+    }
+
+    internal void Fail(Exception error) {
+        Task<uint> completion = null;
+        bool completeCanceled = false;
+        CancellationTokenRegistration pendingCancellation =
+            CancellationTokenRegistration.None;
+        CancellationTokenRegistration cancellation =
+            CancellationTokenRegistration.None;
+        _stateMutex.Lock();
+        try {
+            if (_disposed || _finished) return;
+            _finished = true;
+            _error = error;
+            if (_pendingRead != null) {
+                completion = _pendingRead;
+                completeCanceled = _pendingReadToken.IsCancellationRequested;
+                pendingCancellation = ClearPendingRead();
+            }
+            cancellation = _cancellationRegistration;
+            _cancellationRegistration = CancellationTokenRegistration.None;
+        } finally {
+            _stateMutex.Unlock();
+        }
+        DisposeRegistration(pendingCancellation);
+        DisposeRegistration(cancellation);
+        if (completion != null) {
+            if (completeCanceled) completion.SetCanceled();
+            else completion.SetFault(error);
+        }
+    }
+
+    internal void Cancelled() {
+        Task<uint> completion = null;
+        CancellationTokenRegistration pendingCancellation =
+            CancellationTokenRegistration.None;
+        CancellationTokenRegistration cancellation =
+            CancellationTokenRegistration.None;
+        _stateMutex.Lock();
+        try {
+            if (_disposed) return;
+            if (!_finished) {
+                _finished = true;
+                _cancelled = true;
+                if (_pendingRead != null) {
+                    completion = _pendingRead;
+                    pendingCancellation = ClearPendingRead();
+                }
+            }
+            cancellation = _cancellationRegistration;
+            _cancellationRegistration = CancellationTokenRegistration.None;
+        } finally {
+            _stateMutex.Unlock();
+        }
+        DisposeRegistration(pendingCancellation);
+        DisposeRegistration(cancellation);
+        if (completion != null) completion.SetCanceled();
+    }
+
+    private void RequestCancellation() {
+        Task<uint> completion = null;
+        CancellationTokenRegistration pendingCancellation =
+            CancellationTokenRegistration.None;
+        _stateMutex.Lock();
+        try {
+            if (_disposed || _finished) return;
+            _finished = true;
+            _cancelled = true;
+            if (_pendingRead != null) {
+                completion = _pendingRead;
+                pendingCancellation = ClearPendingRead();
+            }
+        } finally {
+            _stateMutex.Unlock();
+        }
+        DisposeRegistration(pendingCancellation);
+        if (completion != null) completion.SetCanceled();
+        CurlHttpTransport.CancelSend(_state);
+    }
+
+    private CancellationTokenRegistration ClearPendingRead() {
+        CancellationTokenRegistration registration = _pendingReadCancellation;
+        _pendingReadCancellation = CancellationTokenRegistration.None;
+        _pendingRead = null;
+        _pendingReadToken = CancellationToken.None;
+        _pendingDestination = null;
+        _pendingOffset = 0u;
+        _pendingCount = 0u;
+        return registration;
+    }
+
+    private static void DisposeRegistration(
+        CancellationTokenRegistration registration) {
+        try {
+            registration.Dispose();
+        } catch (Exception) {
+            // CancellationTokenSource clears the callback slot before arena
+            // release; don't let cleanup escape a native HTTP callback.
+        }
+    }
+
+    private static void CancelPendingReadTask(Task<uint> pendingRead) {
+        if (!TaskScheduler.CanRunContinuationsOnCurrentThread()) {
+            TaskScheduler.PostFromThread(() => pendingRead.SetCanceled());
+        } else {
+            pendingRead.SetCanceled();
+        }
+    }
+
+    private static void CancelTransport(CurlHttpRequestState state) {
+        if (state == null) return;
+        if (!TaskScheduler.CanRunContinuationsOnCurrentThread()) {
+            TaskScheduler.PostFromThread(() => CurlHttpTransport.CancelSend(state));
+        } else {
+            CurlHttpTransport.CancelSend(state);
+        }
+    }
+
+    private uint Drain(byte[] destination, uint offset, uint count) {
+        uint copied = _count < count ? _count : count;
+        for (uint index = 0u; index < copied; index += 1u) {
+            destination[offset + index] = _buffer[_head];
+            _head = (_head + 1u) % BufferCapacity;
+        }
+        _count -= copied;
+        return copied;
+    }
+
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset, uint count,
+        CancellationToken cancellationToken) {
+        Task<uint> result = null;
+        Task<uint> pendingToRegister = null;
+        CurlHttpRequestState resumeState = null;
+        _stateMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            ValidateRange(buffer, offset, count);
+            if (cancellationToken.IsCancellationRequested) {
+                result = new Task<uint>();
+                result.SetCanceled();
+            } else if (count == 0u) {
+                result = new Task<uint>(0u);
+            } else if (_count != 0u) {
+                uint copied = Drain(buffer, offset, count);
+                result = new Task<uint>(copied);
+                resumeState = _state;
+            } else if (_error != null) {
+                result = new Task<uint>();
+                result.SetFault(_error);
+            } else if (_cancelled) {
+                result = new Task<uint>();
+                result.SetCanceled();
+            } else if (_finished) {
+                result = new Task<uint>(0u);
+            } else {
+                if (_pendingRead != null) {
+                    throw new InvalidOperationException(
+                        "Only one response-body read may be pending.");
+                }
+                _pendingDestination = buffer;
+                _pendingOffset = offset;
+                _pendingCount = count;
+                _pendingReadToken = cancellationToken;
+                Task<uint> pending = new Task<uint>();
+                _pendingRead = pending;
+                pendingToRegister = pending;
+                result = pending;
+            }
+        } finally {
+            _stateMutex.Unlock();
+        }
+        if (pendingToRegister != null) {
+            CurlResponseStream stream = this;
+            Task<uint> pending = pendingToRegister;
+            CancellationTokenRegistration registration =
+                CancellationTokenRegistration.None;
+            Exception registrationError = null;
+            try {
+                registration = cancellationToken.Register(() =>
+                    stream.RequestCancelPendingRead(pending));
+            } catch (Exception exception) {
+                registrationError = exception;
+            }
+            if (registrationError != null) {
+                bool faultPending = false;
+                _stateMutex.Lock();
+                try {
+                    if (_pendingRead == pending) {
+                        ClearPendingRead();
+                        faultPending = true;
+                    }
+                } finally {
+                    _stateMutex.Unlock();
+                }
+                if (faultPending) pending.SetFault(registrationError);
+            } else {
+                bool keepRegistration = false;
+                _stateMutex.Lock();
+                try {
+                    if (_pendingRead == pending) {
+                        _pendingReadCancellation = registration;
+                        keepRegistration = true;
+                    }
+                } finally {
+                    _stateMutex.Unlock();
+                }
+                if (!keepRegistration) DisposeRegistration(registration);
+            }
+        }
+        if (resumeState != null) CurlHttpTransport.ResumeStream(resumeState);
+        return result;
+    }
+
+    private void RequestCancelPendingRead(Task<uint> pending) {
+        CurlResponseStream stream = this;
+        bool postFailed = false;
+        try {
+            TaskScheduler.Post(() => stream.CancelPendingRead(pending));
+        } catch (System.Exception) {
+            postFailed = true;
+        }
+        if (postFailed) CancelPendingRead(pending);
+    }
+
+    private void CancelPendingRead(Task<uint> pending) {
+        CancellationTokenRegistration cancellation =
+            CancellationTokenRegistration.None;
+        bool canceled = false;
+        _stateMutex.Lock();
+        try {
+            if (_pendingRead != pending) return;
+            cancellation = ClearPendingRead();
+            canceled = true;
+        } finally {
+            _stateMutex.Unlock();
+        }
+        DisposeRegistration(cancellation);
+        if (canceled) pending.SetCanceled();
+    }
+
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        int result = 0;
+        Exception error = null;
+        bool unavailable = false;
+        _stateMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            ValidateRange(buffer, offset, count);
+            if (_count != 0u) result = (int)Drain(buffer, offset, count);
+            else if (_error != null) error = _error;
+            else if (_cancelled) error = new OperationCanceledException();
+            else if (_finished) result = 0;
+            else unavailable = true;
+        } finally {
+            _stateMutex.Unlock();
+        }
+        if (error != null) throw error;
+        if (unavailable) {
+            throw new NotSupportedException(
+                "A live HTTP response body must be read asynchronously.");
+        }
+        return result;
+    }
+
+    public override void Flush() {
+        _stateMutex.Lock();
+        try { EnsureNotDisposed(); }
+        finally { _stateMutex.Unlock(); }
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) { throw new NotSupportedException(); }
+
+    private void EnsureNotDisposed() {
+        if (_disposed) throw new ObjectDisposedException("CurlResponseStream");
+    }
+
+    private static void ValidateRange(byte[] buffer, uint offset, uint count) {
+        if (buffer == null) throw new ArgumentNullException("buffer");
+        if (offset > buffer.Length || count > buffer.Length - offset) {
+            throw new ArgumentOutOfRangeException("offset");
+        }
+    }
+
+    public override void Dispose() {
+        CancellationTokenRegistration cancellation =
+            CancellationTokenRegistration.None;
+        CancellationTokenRegistration pendingCancellation =
+            CancellationTokenRegistration.None;
+        Task<uint> pendingRead = null;
+        CurlHttpRequestState state = null;
+        _stateMutex.Lock();
+        try {
+            if (_disposed) return;
+            _disposed = true;
+            cancellation = _cancellationRegistration;
+            _cancellationRegistration = CancellationTokenRegistration.None;
+            pendingRead = _pendingRead;
+            pendingCancellation = ClearPendingRead();
+            state = _state;
+            _state = null;
+            _buffer = null;
+        } finally {
+            _stateMutex.Unlock();
+        }
+        System.Exception firstException = null;
+        try {
+            cancellation.Dispose();
+        } catch (System.Exception exception) {
+            firstException = exception;
+        }
+        try {
+            pendingCancellation.Dispose();
+        } catch (System.Exception exception) {
+            if (firstException == null) firstException = exception;
+        }
+        try {
+            if (pendingRead != null && !pendingRead.IsCompleted)
+                CancelPendingReadTask(pendingRead);
+        } catch (System.Exception exception) {
+            if (firstException == null) firstException = exception;
+        }
+        try {
+            CancelTransport(state);
+        } catch (System.Exception exception) {
+            if (firstException == null) firstException = exception;
+        }
+        if (firstException != null) throw firstException;
+    }
+}
+
+internal final class CurlStreamingContent : HttpContent {
+    private CurlResponseStream _stream;
+    private uint _bufferLimit;
+    private Mutex _streamMutex;
+
+    internal override uint BufferLimit {
+        const get => _bufferLimit;
+    }
+    internal override bool AbortOnBufferLimit { const get => true; }
+
+    internal override System.Exception CreateBufferLimitException() {
+        return new HttpRequestException(
+            "The response exceeds MaxResponseContentBufferSize.");
+    }
+
+    public constructor(CurlResponseStream stream) {
+        if (stream == null) throw new ArgumentNullException("stream");
+        _stream = stream;
+        _bufferLimit = stream.BufferLimit;
+        _streamMutex = new Mutex();
+    }
+
+    public override byte[] ReadAsByteArray() {
+        EnsureNotDisposed();
+        throw new NotSupportedException("Read the live response with ReadAsStream().");
+    }
+
+    public override Stream ReadAsStream() {
+        _streamMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (_stream == null) throw new ObjectDisposedException("CurlStreamingContent");
+            return _stream;
+        } finally {
+            _streamMutex.Unlock();
+        }
+    }
+
+    public override Task CopyToAsync(Stream destination,
+        CancellationToken cancellationToken) {
+        CurlResponseStream stream = null;
+        try {
+            _streamMutex.Lock();
+            try {
+                EnsureNotDisposed();
+                stream = _stream;
+                if (stream == null) {
+                    throw new ObjectDisposedException("CurlStreamingContent");
+                }
+            } finally {
+                _streamMutex.Unlock();
+            }
+            ValidateCopyDestination(destination);
+            cancellationToken.ThrowIfCancellationRequested();
+            return stream.CopyToAsync(destination, cancellationToken);
+        } catch (OperationCanceledException) {
+            return HttpContentCopyOperation.CreateCanceledTask();
+        } catch (Exception exception) {
+            return HttpContentCopyOperation.CreateFaultedTask(exception);
+        }
+    }
+
+    public override void Dispose() {
+        CurlResponseStream stream = null;
+        System.Exception firstException = null;
+        try {
+            MarkDisposed();
+        } catch (System.Exception exception) {
+            firstException = exception;
+        }
+        _streamMutex.Lock();
+        try {
+            stream = _stream;
+            _stream = null;
+        } finally {
+            _streamMutex.Unlock();
+        }
+        try {
+            if (stream != null) stream.Dispose();
+        } catch (System.Exception exception) {
+            if (firstException == null) firstException = exception;
+        }
+        if (firstException != null) throw firstException;
+    }
+}

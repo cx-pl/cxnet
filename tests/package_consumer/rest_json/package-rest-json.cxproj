@@ -1,0 +1,14 @@
+name: M26PackageRestJsonSmoke
+version: 0.1.0
+type: Executable
+targets: [win-x86, win-x64, linux-x64]
+dependencies:
+- cxnet@^0.1.0
+- cxdata@^0.1.0-alpha
+generators:
+- id: cxnet-rest
+  executable: tools/CxnetRestGenerator.exe
+  timeout_seconds: 180
+- id: cxdata-json
+  executable: tools/CxDataJsonGenerator.exe
+  timeout_seconds: 180

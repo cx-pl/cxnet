@@ -1,0 +1,161 @@
+import System;
+import System.IO;
+import System.Net.Http;
+import System.Threading;
+import System.Threading.Tasks;
+
+public final class ThrowingDisposeMemoryStream : MemoryStream {
+    public uint DisposeCalls;
+
+    public constructor() : base() { }
+
+    public override void Dispose() {
+        DisposeCalls += 1u;
+        throw new InvalidOperationException(
+            "injected response stream disposal failure");
+    }
+}
+
+public final class RedirectSetupFailureHandler : HttpMessageHandler {
+    public uint Calls;
+    public uint DisposeCalls;
+    public HttpContent RedirectContent;
+
+    public override void Dispose() {
+        DisposeCalls += 1u;
+        throw new InvalidOperationException("injected handler disposal failure");
+    }
+
+    public override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        Calls += 1u;
+        if (Calls == 1u) {
+            HttpResponseMessage response = new HttpResponseMessage(
+                HttpStatusCode.TemporaryRedirect);
+            response.Headers.Add("Location", "/redirect-target");
+            return new Task<HttpResponseMessage>(response);
+        }
+        RedirectContent = request.Content;
+        throw new InvalidOperationException(
+            "injected redirected-handler setup failure");
+    }
+}
+
+public final class ResponseLifetimeHandler : HttpMessageHandler {
+    public bool CancellationObserved;
+    public ThrowingDisposeMemoryStream ResponseStream;
+
+    public override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        ResponseLifetimeHandler handler = this;
+        cancellationToken.Register(() => {
+            handler.CancellationObserved = true;
+        });
+        ResponseStream = new ThrowingDisposeMemoryStream();
+        HttpResponseMessage response = new HttpResponseMessage();
+        response.Content = new StreamContent(ResponseStream);
+        return new Task<HttpResponseMessage>(response);
+    }
+}
+
+public int Main() {
+    RedirectSetupFailureHandler handler = new RedirectSetupFailureHandler();
+    HttpClient client = new HttpClient(handler);
+    HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post,
+        new Uri("https://redirect.example.test/redirect-source"));
+    request.Content = new StringContent("redirect-body");
+    Task<HttpResponseMessage> pending = client.SendAsync(request);
+    uint steps = 0u;
+    while (!pending.IsCompleted && steps < 10000u) {
+        if (!TaskScheduler.RunOne()) break;
+        steps += 1u;
+    }
+
+    bool failureObserved = false;
+    if (pending.IsCompleted && pending.IsFaulted && !pending.IsCanceled) {
+        try {
+            pending.GetResult();
+        } catch (InvalidOperationException) {
+            failureObserved = true;
+        }
+    }
+
+    bool redirectContentDisposed = false;
+    if (handler.RedirectContent != null) {
+        try {
+            handler.RedirectContent.ReadAsByteArray();
+        } catch (ObjectDisposedException) {
+            redirectContentDisposed = true;
+        }
+    }
+
+    request.Dispose();
+    bool disposeFailureObserved = false;
+    try {
+        client.Dispose();
+    } catch (InvalidOperationException) {
+        disposeFailureObserved = true;
+    }
+    client.Dispose();
+
+    ThrowingDisposeMemoryStream responseStream =
+        new ThrowingDisposeMemoryStream();
+    StreamContent responseContent = new StreamContent(responseStream);
+    HttpResponseMessage response = new HttpResponseMessage();
+    response.Content = responseContent;
+    bool responseDisposeFailureObserved = false;
+    try {
+        response.Dispose();
+    } catch (InvalidOperationException) {
+        responseDisposeFailureObserved = true;
+    }
+    response.Dispose();
+
+    ResponseLifetimeHandler lifetimeHandler = new ResponseLifetimeHandler();
+    HttpClient lifetimeClient = new HttpClient(lifetimeHandler, false);
+    CancellationTokenSource callerCancellation = new CancellationTokenSource();
+    HttpRequestMessage lifetimeRequest = new HttpRequestMessage(
+        HttpMethod.Get, new Uri("https://redirect.example.test/lifetime"));
+    Task<HttpResponseMessage> lifetimePending = lifetimeClient.SendAsync(
+        lifetimeRequest, HttpCompletionOption.ResponseHeadersRead,
+        callerCancellation.Token);
+    uint lifetimeSteps = 0u;
+    while (!lifetimePending.IsCompleted && lifetimeSteps < 10000u) {
+        if (!TaskScheduler.RunOne()) break;
+        lifetimeSteps += 1u;
+    }
+    uint lifetimeCompletionSteps = 0u;
+    while (TaskScheduler.RunOne() && lifetimeCompletionSteps < 10000u) {
+        lifetimeCompletionSteps += 1u;
+    }
+    HttpResponseMessage lifetimeResponse = null;
+    bool lifetimeResponseReceived = false;
+    if (lifetimePending.IsCompleted && !lifetimePending.IsFaulted &&
+        !lifetimePending.IsCanceled) {
+        lifetimeResponse = lifetimePending.GetResult();
+        lifetimeResponseReceived = lifetimeResponse != null;
+    }
+    bool lifetimeContentFailureObserved = false;
+    if (lifetimeResponse != null) {
+        try {
+            lifetimeResponse.Dispose();
+        } catch (InvalidOperationException) {
+            lifetimeContentFailureObserved = true;
+        }
+    }
+    callerCancellation.Cancel();
+    bool sendLifetimeReleased = !lifetimeHandler.CancellationObserved;
+    lifetimeRequest.Dispose();
+    lifetimeClient.Dispose();
+
+    if (!pending.IsCompleted || !failureObserved || !redirectContentDisposed ||
+        handler.Calls != 2u) return 1;
+    if (!disposeFailureObserved || handler.DisposeCalls != 1u) return 2;
+    if (!responseDisposeFailureObserved || responseStream.DisposeCalls != 1u)
+        return 3;
+    if (!lifetimeResponseReceived) return 4;
+    if (!lifetimeContentFailureObserved) return 5;
+    if (!sendLifetimeReleased) return 6;
+    if (lifetimeHandler.ResponseStream.DisposeCalls != 1u) return 7;
+    return 0;
+}

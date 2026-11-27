@@ -1,0 +1,136 @@
+import System;
+import System.IO;
+import System.Net.Http;
+import System.Threading;
+import System.Threading.Tasks;
+
+namespace UploadSourceFailure;
+
+public final class FaultingUploadStream : Stream {
+    private TaskCompletionSource<uint> _readFailure;
+    private uint _readCalls;
+    private bool _readPending;
+    private uint _disposeCount;
+
+    public constructor() {
+        _readFailure = new TaskCompletionSource<uint>();
+        _readCalls = 0u;
+        _readPending = false;
+        _disposeCount = 0u;
+    }
+
+    public bool ReadPending { const get => _readPending; }
+    public uint DisposeCount { const get => _disposeCount; }
+
+    public override bool CanRead { get => true; }
+    public override bool CanWrite { get => false; }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset,
+        uint count, CancellationToken cancellationToken) {
+        _readCalls += 1u;
+        if (_readCalls == 1u) {
+            buffer[offset] = (byte)'M';
+            buffer[offset + 1u] = (byte)'2';
+            buffer[offset + 2u] = (byte)'6';
+            buffer[offset + 3u] = (byte)'!';
+            return new Task<uint>(4u);
+        }
+        _readPending = true;
+        return _readFailure.Task;
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { _disposeCount += 1u; }
+
+    public void FailPendingRead() {
+        _readFailure.SetException(new IOException("injected upload source failure"));
+    }
+}
+
+public int RunSourceFailure(string uploadUri, string recoveryUri) {
+    FaultingUploadStream stream = new FaultingUploadStream();
+    StreamContent content = new StreamContent(stream);
+    HttpRequestMessage request = new HttpRequestMessage(
+        HttpMethod.Post, new Uri(uploadUri));
+    request.Content = content;
+    HttpClient client = new HttpClient();
+    Task<HttpResponseMessage> send = client.SendAsync(request);
+
+    uint steps = 0u;
+    while (!stream.ReadPending && !send.IsCompleted && steps < 100000u) {
+        if (!TaskScheduler.RunOne()) Thread.Yield();
+        steps += 1u;
+    }
+    if (!stream.ReadPending || send.IsCompleted) return 2;
+
+    AtomicInt gateReleased = new AtomicInt(0);
+    Thread gateThread = Thread.Start(() => {
+        Console.ReadLine();
+        TaskScheduler.PostFromThread(() => { gateReleased.Exchange(1); });
+    });
+    steps = 0u;
+    while (gateReleased.Value == 0 && steps < 100000u) {
+        if (!TaskScheduler.RunOne()) Thread.Yield();
+        steps += 1u;
+    }
+    gateThread.Join();
+    if (gateReleased.Value == 0) return 3;
+
+    stream.FailPendingRead();
+    steps = 0u;
+    while (!send.IsCompleted && steps < 100000u) {
+        if (!TaskScheduler.RunOne()) Thread.Yield();
+        steps += 1u;
+    }
+    if (!send.IsCompleted || !send.IsFaulted) return 4;
+    bool expectedFault = false;
+    try {
+        send.GetResult();
+    } catch (HttpRequestException exception) {
+        expectedFault = exception.InnerException != null;
+    }
+    if (!expectedFault) return 5;
+
+    content.Dispose();
+    request.Dispose();
+    if (stream.DisposeCount != 1u) return 6;
+
+    Task<HttpResponseMessage> recovery = client.GetAsync(recoveryUri);
+    steps = 0u;
+    while (!recovery.IsCompleted && steps < 100000u) {
+        if (!TaskScheduler.RunOne()) Thread.Yield();
+        steps += 1u;
+    }
+    if (!recovery.IsCompleted || recovery.IsFaulted || recovery.IsCanceled)
+        return 7;
+    HttpResponseMessage response = recovery.GetResult();
+    if ((int)response.StatusCode != 200) return 8;
+    Task<string> responseBody = response.Content.ReadAsStringAsync();
+    steps = 0u;
+    while (!responseBody.IsCompleted && steps < 100000u) {
+        if (!TaskScheduler.RunOne()) Thread.Yield();
+        steps += 1u;
+    }
+    if (!responseBody.IsCompleted || responseBody.IsFaulted ||
+        responseBody.GetResult() != "recovered") return 9;
+
+    response.Dispose();
+    client.Dispose();
+    return 0;
+}
+
+public int Main(string[] args) {
+    if (args == null || args.Length != 3u || args[0] != "--source-failure")
+        return 1;
+    return RunSourceFailure(args[1], args[2]);
+}

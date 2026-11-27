@@ -1,0 +1,908 @@
+import System;
+import System.IO;
+import System.Threading;
+import System.Threading.Tasks;
+
+namespace System.Net.Http;
+
+public abstract class HttpContent : System.IDisposable {
+    internal static extern bool TestShouldFailBufferingStarted();
+
+    private HttpHeaders _headers;
+    private AtomicInt _disposed;
+    private Mutex _readMutex;
+    private Task<Stream> _streamReadTask;
+    private HttpContentBufferingOperation _bufferingOperation;
+    private Task<byte[]> _bufferingCompletion;
+    private Task<string> _stringReadTask;
+
+    public HttpHeaders Headers { const get => _headers; }
+    internal virtual bool CanReplay { get => true; }
+    internal virtual uint BufferLimit { const get => 0xFFFFFFFFu; }
+    internal virtual bool AbortOnBufferLimit { const get => false; }
+    internal virtual void PrepareForBuffering() { }
+    internal virtual void OnBufferingStarted() { }
+    internal virtual void OnBufferingCompleted(byte[] contentBytes) { }
+    internal virtual void OnBufferingFailed() { }
+
+    internal virtual System.Exception CreateBufferLimitException() {
+        return new IOException("Content exceeded its configured buffer limit.");
+    }
+
+    public constructor() {
+        _headers = new HttpHeaders();
+        _disposed = new AtomicInt(0);
+        _readMutex = new Mutex();
+    }
+
+    protected void EnsureNotDisposed() {
+        if (_disposed.Value != 0) {
+            throw new System.ObjectDisposedException("HttpContent");
+        }
+    }
+
+    protected void MarkDisposed() {
+        HttpContentBufferingOperation bufferingOperation = null;
+        _readMutex.Lock();
+        try {
+            _disposed.Value = 1;
+            bufferingOperation = _bufferingOperation;
+        } finally {
+            _readMutex.Unlock();
+        }
+        if (bufferingOperation != null) bufferingOperation.Cancel();
+    }
+
+    protected void ValidateCopyDestination(Stream destination) {
+        if (destination == null) {
+            throw new System.ArgumentNullException("destination");
+        }
+        if (!destination.CanWrite) {
+            throw new System.ArgumentException(
+                "Destination stream is not writable.", "destination");
+        }
+    }
+
+    public abstract byte[] ReadAsByteArray();
+
+    public virtual Stream ReadAsStream() {
+        EnsureNotDisposed();
+        return new MemoryStream(ReadAsByteArray());
+    }
+
+    // Streaming transports may consume a source directly. Buffered content
+    // keeps the default null and continues through ReadAsByteArray().
+    internal virtual Stream GetTransportReadStream() {
+        EnsureNotDisposed();
+        return null;
+    }
+
+    // A streaming transport calls this only after native request setup succeeds.
+    // Buffered content and custom content have no one-shot source state to commit.
+    internal virtual void OnTransportReadStarted(Stream source) { }
+    internal virtual void OnTransportSetupFailed(Stream source) { }
+
+    internal virtual HttpContent CreateReplayContent() {
+        EnsureNotDisposed();
+        ByteArrayContent replay = new ByteArrayContent(ReadAsByteArray());
+        CopyHeadersTo(replay);
+        return replay;
+    }
+
+    protected void CopyHeadersTo(HttpContent target) {
+        try {
+            HttpHeaders snapshot = Headers.Snapshot();
+            for (uint index = 0u; index < snapshot.Count; index += 1u) {
+                HttpHeader header = snapshot.Get(index);
+                target.Headers.TryAddWithoutValidation(header.Name, header.Value);
+            }
+        } catch (Exception exception) {
+            try {
+                target.Dispose();
+            } catch (Exception) { }
+            throw exception;
+        }
+    }
+
+    public Task<Stream> ReadAsStreamAsync() {
+        EnsureNotDisposed();
+        Task<Stream> completion = null;
+        bool startRead = false;
+        _readMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            completion = _streamReadTask;
+            if (completion == null) {
+                completion = new Task<Stream>();
+                _streamReadTask = completion;
+                startRead = true;
+            }
+        } finally {
+            _readMutex.Unlock();
+        }
+        if (startRead) {
+            try {
+                completion.SetResult(ReadAsStream());
+            } catch (OperationCanceledException) {
+                completion.SetCanceled();
+            } catch (Exception exception) {
+                completion.SetFault(exception);
+            }
+        }
+        return completion;
+    }
+
+    public string ReadAsString() {
+        return ReadAsString(HttpTextEncoding.GetCharset(Headers));
+    }
+
+    public string ReadAsString(string charset) {
+        EnsureNotDisposed();
+        string normalizedCharset = HttpTextEncoding.NormalizeCharset(charset);
+        return HttpTextEncoding.Decode(ReadAsByteArray(), normalizedCharset);
+    }
+
+    // Reads only a bounded byte prefix. REST error handling uses this for
+    // headers-first responses so it can retain a short diagnostic without
+    // buffering the entire live body.
+    internal Task<string> ReadAsStringPrefixAsync(uint maxBytes) {
+        EnsureNotDisposed();
+        try {
+            Stream source = ReadAsStream();
+            HttpContentPrefixReadOperation operation =
+                new HttpContentPrefixReadOperation(source, maxBytes,
+                    HttpTextEncoding.GetCharset(Headers));
+            return operation.Start();
+        } catch (OperationCanceledException) {
+            Task<string> canceled = new Task<string>();
+            canceled.SetCanceled();
+            return canceled;
+        } catch (Exception exception) {
+            Task<string> failed = new Task<string>();
+            failed.SetFault(exception);
+            return failed;
+        }
+    }
+
+    internal virtual string ReadAsStringPrefix(uint maxBytes) {
+        EnsureNotDisposed();
+        string charset = HttpTextEncoding.GetCharset(Headers);
+        return ReadStringPrefixFromStream(ReadAsStream(), maxBytes, charset);
+    }
+
+    protected string ReadStringPrefixFromStream(Stream source, uint maxBytes,
+        string charset) {
+        if (source == null) throw new ArgumentNullException("source");
+        byte[] bytes = new byte[maxBytes];
+        uint total = 0u;
+        while (total < maxBytes) {
+            int read = source.Read(bytes, total, maxBytes - total);
+            if (read < 0) {
+                throw new InvalidOperationException(
+                    "The response stream returned a negative byte count.");
+            }
+            if (read == 0) break;
+            uint count = (uint)read;
+            if (count > maxBytes - total) {
+                throw new InvalidOperationException(
+                    "The response stream returned more bytes than requested.");
+            }
+            total += count;
+        }
+        if (total < bytes.Length) {
+            byte[] prefix = new byte[total];
+            for (uint index = 0u; index < total; index += 1u) {
+                prefix[index] = bytes[index];
+            }
+            bytes = prefix;
+        }
+        if (total == maxBytes &&
+            HttpTextEncoding.NormalizeCharset(charset) == "utf-8") {
+            bytes = HttpTextEncoding.TrimIncompleteUtf8Tail(bytes);
+        }
+        return HttpTextEncoding.Decode(bytes, charset);
+    }
+
+    public virtual Task<byte[]> ReadAsByteArrayAsync() {
+        EnsureNotDisposed();
+        Task<byte[]> completion = null;
+        bool setupBuffering = false;
+        _readMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (_bufferingCompletion != null) {
+                completion = _bufferingCompletion;
+            } else {
+                completion = new Task<byte[]>();
+                _bufferingCompletion = completion;
+                setupBuffering = true;
+            }
+        } finally {
+            _readMutex.Unlock();
+        }
+        if (setupBuffering) {
+            try {
+                SetupBuffering(completion);
+            } catch (OperationCanceledException) {
+                CompleteBufferingSetupFailure(completion, null,
+                    new OperationCanceledException());
+            } catch (Exception exception) {
+                CompleteBufferingSetupFailure(completion, null, exception);
+            }
+        }
+        return completion;
+    }
+
+    private void SetupBuffering(Task<byte[]> completion) {
+        HttpContentBufferingOperation operation = null;
+        try {
+            PrepareForBuffering();
+            Stream source = ReadAsStream();
+            operation = new HttpContentBufferingOperation(
+                this, source, BufferLimit, AbortOnBufferLimit, completion);
+            if (TestShouldFailBufferingStarted()) {
+                throw new IOException("Injected OnBufferingStarted failure.");
+            }
+            OnBufferingStarted();
+
+            bool publishOperation = false;
+            _readMutex.Lock();
+            try {
+                if (_disposed.Value == 0 &&
+                    _bufferingCompletion == completion) {
+                    _bufferingOperation = operation;
+                    publishOperation = true;
+                }
+            } finally {
+                _readMutex.Unlock();
+            }
+            if (!publishOperation) {
+                operation.Cancel();
+                return;
+            }
+            operation.Start();
+        } catch (OperationCanceledException) {
+            CompleteBufferingSetupFailure(completion, operation,
+                new OperationCanceledException());
+        } catch (Exception exception) {
+            CompleteBufferingSetupFailure(completion, operation, exception);
+        }
+    }
+
+    private void CompleteBufferingSetupFailure(Task<byte[]> completion,
+        HttpContentBufferingOperation operation, Exception exception) {
+        try {
+            if (operation != null) operation.FailSetup(exception);
+            else if (exception is OperationCanceledException)
+                completion.SetCanceled();
+            else completion.SetFault(exception);
+        } catch (Exception) {
+            // Task callbacks are external code. A throwing callback must not
+            // skip clearing a setup that was never published.
+        } finally {
+            ClearFailedBufferingSetup(completion);
+        }
+    }
+
+    private void ClearFailedBufferingSetup(Task<byte[]> completion) {
+        _readMutex.Lock();
+        try {
+            if (_bufferingCompletion == completion &&
+                _bufferingOperation == null) {
+                _bufferingCompletion = null;
+            }
+        } finally {
+            _readMutex.Unlock();
+        }
+    }
+
+    public virtual Task<string> ReadAsStringAsync() {
+        EnsureNotDisposed();
+        Task<string> completion = null;
+        bool startRead = false;
+        _readMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            completion = _stringReadTask;
+            if (completion == null) {
+                completion = new Task<string>();
+                _stringReadTask = completion;
+                startRead = true;
+            }
+        } finally {
+            _readMutex.Unlock();
+        }
+        if (startRead) StartStringRead(completion);
+        return completion;
+    }
+
+    private void StartStringRead(Task<string> completion) {
+        try {
+            Task<string> pending = CreateStringReadTask(
+                HttpTextEncoding.GetCharset(Headers));
+            if (pending == null) {
+                throw new InvalidOperationException(
+                    "The content string read returned no task.");
+            }
+            pending.OnCompleted(() => CompleteStringReadTask(
+                pending, completion));
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+    }
+
+    private static void CompleteStringReadTask(Task<string> pending,
+        Task<string> completion) {
+        try {
+            completion.SetResult(pending.GetResult());
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+    }
+
+    public Task<string> ReadAsStringAsync(string charset) {
+        EnsureNotDisposed();
+        if (charset == null) throw new System.ArgumentNullException("charset");
+        return CreateStringReadTask(charset);
+    }
+
+    private Task<string> CreateStringReadTask(string charset) {
+        string normalizedCharset = null;
+        try {
+            normalizedCharset = HttpTextEncoding.NormalizeCharset(charset);
+        } catch (Exception exception) {
+            return CreateFaultedStringReadTask(exception);
+        }
+        Task<byte[]> pending = null;
+        try {
+            pending = ReadAsByteArrayAsync();
+        } catch (OperationCanceledException) {
+            return CreateCanceledStringReadTask();
+        } catch (Exception exception) {
+            return CreateFaultedStringReadTask(exception);
+        }
+        Task<string> completion = new Task<string>();
+        try {
+            pending.OnCompleted(() => CompleteStringRead(
+                pending, completion, normalizedCharset));
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+        return completion;
+    }
+
+    private static Task<string> CreateCanceledStringReadTask() {
+        Task<string> canceled = new Task<string>();
+        canceled.SetCanceled();
+        return canceled;
+    }
+
+    private static Task<string> CreateFaultedStringReadTask(Exception exception) {
+        Task<string> failed = new Task<string>();
+        failed.SetFault(exception);
+        return failed;
+    }
+
+    private static void CompleteStringRead(Task<byte[]> pending,
+        Task<string> completion, string charset) {
+        try {
+            completion.SetResult(HttpTextEncoding.Decode(
+                pending.GetResult(), charset));
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+    }
+
+    public Task CopyToAsync(Stream destination) {
+        return CopyToAsync(destination, CancellationToken.None);
+    }
+
+    public virtual async Task CopyToAsync(Stream destination, CancellationToken cancellationToken) {
+        EnsureNotDisposed();
+        ValidateCopyDestination(destination);
+        cancellationToken.ThrowIfCancellationRequested();
+        byte[] bytes = ReadAsByteArray();
+        await destination.WriteAsync(bytes, 0u, bytes.Length, cancellationToken);
+    }
+
+    public virtual void Dispose() { MarkDisposed(); }
+}
+
+internal final class HttpContentBufferingOperation {
+    private HttpContent _content;
+    private Stream _source;
+    private MemoryStream _output;
+    private byte[] _chunk;
+    private Task<byte[]> _completion;
+    private uint _bufferLimit;
+    private uint _bufferedBytes;
+    private bool _abortOnBufferLimit;
+    private bool _bufferingSucceeded;
+    private Mutex _operationMutex;
+
+    public Task<byte[]> Completion { const get => _completion; }
+
+    public constructor(HttpContent content, Stream source, uint bufferLimit,
+        bool abortOnBufferLimit, Task<byte[]> completion) {
+        if (content == null) throw new System.ArgumentNullException("content");
+        if (source == null) throw new System.ArgumentNullException("source");
+        if (completion == null)
+            throw new System.ArgumentNullException("completion");
+        _content = content;
+        _source = source;
+        _output = new MemoryStream();
+        _chunk = new byte[8192u];
+        _completion = completion;
+        _bufferLimit = bufferLimit;
+        _bufferedBytes = 0u;
+        _abortOnBufferLimit = abortOnBufferLimit;
+        _bufferingSucceeded = false;
+        _operationMutex = new Mutex();
+    }
+
+    public Task<byte[]> Start() {
+        _operationMutex.Lock();
+        bool shouldStart = false;
+        try {
+            shouldStart = !_completion.IsCompleted;
+        } finally {
+            _operationMutex.Unlock();
+        }
+        if (!shouldStart) return _completion;
+        ReadNext();
+        return _completion;
+    }
+
+    public void Cancel() {
+        _operationMutex.Lock();
+        try {
+            if (_completion.IsCompleted) return;
+            try {
+                _completion.SetCanceled();
+            } finally {
+                Finish();
+            }
+        } finally {
+            _operationMutex.Unlock();
+        }
+    }
+
+    public void FailSetup(Exception exception) {
+        if (exception == null) throw new System.ArgumentNullException("exception");
+        Fail(exception);
+    }
+
+    private void ReadNext() {
+        Stream source = null;
+        byte[] chunk = null;
+        uint readCount = 0u;
+        _operationMutex.Lock();
+        try {
+            if (_completion.IsCompleted) return;
+            source = _source;
+            chunk = _chunk;
+            if (source != null && chunk != null) {
+                readCount = chunk.Length;
+                if (_bufferedBytes <= _bufferLimit &&
+                    _bufferLimit - _bufferedBytes < readCount) {
+                    readCount = _bufferLimit - _bufferedBytes + 1u;
+                }
+            }
+        } finally {
+            _operationMutex.Unlock();
+        }
+        if (source == null || chunk == null) {
+            Fail(new InvalidOperationException(
+                "The content buffering operation has no active source."));
+            return;
+        }
+        Task<uint> read = null;
+        try {
+            read = source.ReadAsync(chunk, 0u, readCount,
+                CancellationToken.None);
+            if (read == null) {
+                throw new InvalidOperationException(
+                    "The content stream returned no read task.");
+            }
+        } catch (OperationCanceledException) {
+            Fail(new OperationCanceledException());
+            return;
+        } catch (Exception exception) {
+            Fail(exception);
+            return;
+        }
+        HttpContentBufferingOperation operation = this;
+        try {
+            read.OnCompleted(() => operation.CompleteRead(read, readCount));
+        } catch (OperationCanceledException) {
+            Fail(new OperationCanceledException());
+        } catch (Exception exception) {
+            Fail(exception);
+        }
+    }
+
+    private void CompleteRead(Task<uint> read, uint requestedCount) {
+        uint count = 0u;
+        try {
+            count = read.GetResult();
+        } catch (OperationCanceledException) {
+            Fail(new OperationCanceledException());
+            return;
+        } catch (Exception exception) {
+            Fail(exception);
+            return;
+        }
+        if (count > requestedCount) {
+            Fail(new InvalidOperationException(
+                "The content stream returned more bytes than requested."));
+            return;
+        }
+        if (count == 0u) {
+            _operationMutex.Lock();
+            try {
+                if (_completion.IsCompleted) return;
+                try {
+                    byte[] contentBytes = _output.ToArray();
+                    _content.OnBufferingCompleted(contentBytes);
+                    _bufferingSucceeded = true;
+                    _completion.SetResult(contentBytes);
+                } catch (Exception exception) {
+                    if (!_completion.IsCompleted) _completion.SetFault(exception);
+                } finally {
+                    Finish();
+                }
+            } finally {
+                _operationMutex.Unlock();
+            }
+            return;
+        }
+        Stream sourceToAbort = null;
+        Task write = null;
+        Exception completionFailure = null;
+        _operationMutex.Lock();
+        try {
+            if (_completion.IsCompleted) return;
+            if (_bufferedBytes > _bufferLimit ||
+                count > _bufferLimit - _bufferedBytes) {
+                Exception limitException = null;
+                try {
+                    limitException = _content.CreateBufferLimitException();
+                } catch (Exception exception) {
+                    limitException = exception;
+                }
+                if (_abortOnBufferLimit) sourceToAbort = _source;
+                try {
+                    _completion.SetFault(limitException);
+                } catch (Exception exception) {
+                    completionFailure = exception;
+                } finally {
+                    Finish();
+                }
+            } else {
+                _bufferedBytes += count;
+                try {
+                    write = _output.WriteAsync(_chunk, 0u, count,
+                        CancellationToken.None);
+                    if (write == null) {
+                        throw new InvalidOperationException(
+                            "The content buffer returned no write task.");
+                    }
+                } catch (Exception exception) {
+                    try {
+                        if (exception is OperationCanceledException)
+                            _completion.SetCanceled();
+                        else _completion.SetFault(exception);
+                    } finally {
+                        Finish();
+                    }
+                }
+            }
+        } finally {
+            _operationMutex.Unlock();
+        }
+        if (sourceToAbort != null) {
+            try {
+                sourceToAbort.Dispose();
+            } catch (Exception) { }
+        }
+        if (completionFailure != null) throw completionFailure;
+        if (write == null) return;
+        HttpContentBufferingOperation operation = this;
+        try {
+            write.OnCompleted(() => operation.CompleteWrite(write));
+        } catch (OperationCanceledException) {
+            Fail(new OperationCanceledException());
+        } catch (Exception exception) {
+            Fail(exception);
+        }
+    }
+
+    private void CompleteWrite(Task write) {
+        try {
+            write.GetResult();
+        } catch (OperationCanceledException) {
+            Fail(new OperationCanceledException());
+            return;
+        } catch (Exception exception) {
+            Fail(exception);
+            return;
+        }
+        _operationMutex.Lock();
+        try {
+            if (_completion.IsCompleted) return;
+        } finally {
+            _operationMutex.Unlock();
+        }
+        ReadNext();
+    }
+
+    private void Fail(Exception exception) {
+        _operationMutex.Lock();
+        try {
+            if (_completion.IsCompleted) return;
+            try {
+                if (exception is OperationCanceledException)
+                    _completion.SetCanceled();
+                else _completion.SetFault(exception);
+            } finally {
+                Finish();
+            }
+        } finally {
+            _operationMutex.Unlock();
+        }
+    }
+
+    private void Finish() {
+        if (!_bufferingSucceeded && _content != null) {
+            try {
+                _content.OnBufferingFailed();
+            } catch (Exception) { }
+        }
+        if (_output != null) _output.Dispose();
+        _source = null;
+        _content = null;
+        _output = null;
+        _chunk = null;
+    }
+}
+
+internal final class HttpContentCopyOperation {
+    public static Task CopyBytesAsync(byte[] bytes, Stream destination,
+        CancellationToken cancellationToken) {
+        Task completion = new TaskCompletionSource().Task;
+        try {
+            cancellationToken.ThrowIfCancellationRequested();
+            Task write = destination.WriteAsync(bytes, 0u, bytes.Length,
+                cancellationToken);
+            if (write == null) {
+                throw new InvalidOperationException("The destination stream returned no write task.");
+            }
+            write.OnCompleted(() => CompleteByteWrite(write, completion));
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+        return completion;
+    }
+
+    public static Task CreateFaultedTask(Exception exception) {
+        Task completion = new TaskCompletionSource().Task;
+        if (exception is OperationCanceledException) completion.SetCanceled();
+        else completion.SetFault(exception);
+        return completion;
+    }
+
+    public static Task CreateCanceledTask() {
+        Task completion = new TaskCompletionSource().Task;
+        completion.SetCanceled();
+        return completion;
+    }
+
+    private static void CompleteByteWrite(Task write, Task completion) {
+        try {
+            write.GetResult();
+            completion.SetResult();
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+    }
+}
+
+internal final class HttpContentPrefixReadOperation {
+    private Stream _source;
+    private MemoryStream _output;
+    private byte[] _chunk;
+    private uint _maxBytes;
+    private uint _bytesRead;
+    private string _charset;
+    private Task<string> _completion;
+    private Mutex _operationMutex;
+    private bool _finalized;
+
+    public constructor(Stream source, uint maxBytes, string charset) {
+        if (source == null) throw new ArgumentNullException("source");
+        _source = source;
+        _output = new MemoryStream();
+        _chunk = new byte[maxBytes < 8192u ? maxBytes : 8192u];
+        _maxBytes = maxBytes;
+        _bytesRead = 0u;
+        _charset = charset;
+        _completion = new Task<string>();
+        _operationMutex = new Mutex();
+        _finalized = false;
+    }
+
+    public Task<string> Start() {
+        if (_maxBytes == 0u) CompleteSuccess();
+        else ReadNext();
+        return _completion;
+    }
+
+    private void ReadNext() {
+        Task<uint> read = null;
+        uint requested = 0u;
+        byte[] chunk = null;
+        bool canceled = false;
+        Exception setupError = null;
+        _operationMutex.Lock();
+        try {
+            if (_finalized) return;
+            Stream source = _source;
+            chunk = _chunk;
+            if (source == null || chunk == null) {
+                setupError = new InvalidOperationException(
+                    "The response stream is no longer available.");
+            } else {
+                requested = chunk.Length;
+                if (requested > _maxBytes - _bytesRead) {
+                    requested = _maxBytes - _bytesRead;
+                }
+                try {
+                    read = source.ReadAsync(chunk, 0u, requested,
+                        CancellationToken.None);
+                    if (read == null) {
+                        throw new InvalidOperationException(
+                            "The response stream returned no read task.");
+                    }
+                } catch (OperationCanceledException) {
+                    canceled = true;
+                } catch (Exception exception) {
+                    setupError = exception;
+                }
+            }
+        } finally {
+            _operationMutex.Unlock();
+        }
+        if (canceled) {
+            CompleteCanceled();
+            return;
+        }
+        if (setupError != null) {
+            CompleteFault(setupError);
+            return;
+        }
+        HttpContentPrefixReadOperation operation = this;
+        try {
+            read.OnCompleted(() => operation.CompleteRead(
+                read, requested, chunk));
+        } catch (OperationCanceledException) {
+            CompleteCanceled();
+        } catch (Exception exception) {
+            CompleteFault(exception);
+        }
+    }
+
+    private void CompleteRead(Task<uint> read, uint requested, byte[] chunk) {
+        uint count = 0u;
+        try {
+            count = read.GetResult();
+        } catch (OperationCanceledException) {
+            CompleteCanceled();
+            return;
+        } catch (Exception exception) {
+            CompleteFault(exception);
+            return;
+        }
+        bool complete = false;
+        Exception processingError = null;
+        _operationMutex.Lock();
+        try {
+            if (_finalized) return;
+            if (count > requested) {
+                processingError = new InvalidOperationException(
+                    "The response stream returned more bytes than requested.");
+            } else if (count != 0u) {
+                try {
+                    if (_output == null || chunk == null) {
+                        throw new InvalidOperationException(
+                            "The response prefix buffer is no longer available.");
+                    }
+                    _output.Write(chunk, 0u, count);
+                    _bytesRead += count;
+                } catch (Exception exception) {
+                    processingError = exception;
+                }
+            }
+            if (processingError == null) {
+                complete = count == 0u || _bytesRead >= _maxBytes;
+            }
+        } finally {
+            _operationMutex.Unlock();
+        }
+        if (processingError != null) {
+            CompleteFault(processingError);
+            return;
+        }
+        if (complete) CompleteSuccess();
+        else ReadNext();
+    }
+
+    private void CompleteSuccess() {
+        _operationMutex.Lock();
+        try {
+            if (_finalized) return;
+            _finalized = true;
+            try {
+                byte[] bytes = _output.ToArray();
+                if (_bytesRead == _maxBytes &&
+                    HttpTextEncoding.NormalizeCharset(_charset) == "utf-8") {
+                    bytes = HttpTextEncoding.TrimIncompleteUtf8Tail(bytes);
+                }
+                _completion.SetResult(HttpTextEncoding.Decode(bytes, _charset));
+            } catch (OperationCanceledException) {
+                if (!_completion.IsCompleted) _completion.SetCanceled();
+            } catch (Exception exception) {
+                if (!_completion.IsCompleted) _completion.SetFault(exception);
+            } finally {
+                FinishLocked();
+            }
+        } finally {
+            _operationMutex.Unlock();
+        }
+    }
+
+    private void CompleteCanceled() {
+        _operationMutex.Lock();
+        try {
+            if (_finalized) return;
+            _finalized = true;
+            try {
+                _completion.SetCanceled();
+            } finally { FinishLocked(); }
+        } finally {
+            _operationMutex.Unlock();
+        }
+    }
+
+    private void CompleteFault(Exception exception) {
+        _operationMutex.Lock();
+        try {
+            if (_finalized) return;
+            _finalized = true;
+            try {
+                _completion.SetFault(exception);
+            } finally { FinishLocked(); }
+        } finally {
+            _operationMutex.Unlock();
+        }
+    }
+
+    private void FinishLocked() {
+        if (_output != null) _output.Dispose();
+        _source = null;
+        _output = null;
+        _chunk = null;
+        _charset = null;
+    }
+}

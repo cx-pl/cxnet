@@ -1,0 +1,185 @@
+import System;
+import System.Net.Http;
+import System.Threading;
+
+namespace System.Net.Http.Rest;
+
+// Public because CX closes generic methods in consumer modules. The class is
+// non-instantiable and these methods are reserved for generated REST code.
+public final class RestResponseState {
+    private static Mutex _mutex;
+    private static bool _initialized = Initialize();
+
+    private constructor() {}
+
+    private static bool Initialize() {
+        _mutex = new Mutex();
+        return true;
+    }
+
+    public static void Lock() { _mutex.Lock(); }
+    public static void Unlock() { _mutex.Unlock(); }
+}
+
+// Owns the underlying response until disposed. Generated materializing calls
+// may detach and dispose that response after reading a DTO; raw response APIs
+// should return the response directly instead of this wrapper.
+public final class RestResponse<T> : IDisposable {
+    private HttpResponseMessage _response;
+    private bool _hasValue;
+    private string _errorContent;
+    private bool _disposed;
+    // Keep generic storage after the shared response state so non-generic
+    // property accessors use the same field offsets for every T.
+    private T _value;
+
+    public HttpStatusCode StatusCode {
+        get {
+            RestResponseState.Lock();
+            try {
+                if (_disposed) throw new ObjectDisposedException("RestResponse");
+                if (_response == null) throw new InvalidOperationException();
+                return _response.StatusCode;
+            } finally {
+                RestResponseState.Unlock();
+            }
+        }
+    }
+
+    public HttpHeaders Headers {
+        get {
+            RestResponseState.Lock();
+            try {
+                if (_disposed) throw new ObjectDisposedException("RestResponse");
+                if (_response == null) throw new InvalidOperationException();
+                return _response.Headers;
+            } finally {
+                RestResponseState.Unlock();
+            }
+        }
+    }
+
+    public HttpContent Content {
+        get {
+            RestResponseState.Lock();
+            try {
+                if (_disposed) throw new ObjectDisposedException("RestResponse");
+                if (_response == null) throw new InvalidOperationException();
+                return _response.Content;
+            } finally {
+                RestResponseState.Unlock();
+            }
+        }
+    }
+
+    public bool HasValue {
+        get {
+            RestResponseState.Lock();
+            try {
+                if (_disposed) throw new ObjectDisposedException("RestResponse");
+                return _hasValue;
+            } finally {
+                RestResponseState.Unlock();
+            }
+        }
+    }
+    public string ErrorContent {
+        get {
+            RestResponseState.Lock();
+            try {
+                if (_disposed) throw new ObjectDisposedException("RestResponse");
+                return _errorContent;
+            } finally {
+                RestResponseState.Unlock();
+            }
+        }
+    }
+    public bool IsSuccessStatusCode {
+        get {
+            RestResponseState.Lock();
+            try {
+                if (_disposed) throw new ObjectDisposedException("RestResponse");
+                if (_response == null) throw new InvalidOperationException();
+                return _response.IsSuccessStatusCode;
+            } finally {
+                RestResponseState.Unlock();
+            }
+        }
+    }
+
+    public constructor(const T value) {
+        _value = value;
+        _errorContent = "";
+        _disposed = false;
+    }
+
+    // These initialization methods are public so a generated REST client in a
+    // consuming module can attach the decoded value to its owned response.
+    public void SetResponse(HttpResponseMessage response) {
+        if (response == null) throw new ArgumentNullException("response");
+        RestResponseState.Lock();
+        try {
+            if (_disposed) throw new ObjectDisposedException("RestResponse");
+            if (_response != null) throw new InvalidOperationException(
+                "A REST response wrapper already owns an HTTP response.");
+            _response = response;
+        } finally {
+            RestResponseState.Unlock();
+        }
+    }
+
+    public void SetHasValue(bool hasValue) {
+        RestResponseState.Lock();
+        try {
+            if (_disposed) throw new ObjectDisposedException("RestResponse");
+            if (_response == null) throw new InvalidOperationException();
+            _hasValue = hasValue;
+        } finally {
+            RestResponseState.Unlock();
+        }
+    }
+
+    public void SetErrorContent(string errorContent) {
+        RestResponseState.Lock();
+        try {
+            if (_disposed) throw new ObjectDisposedException("RestResponse");
+            if (_response == null) throw new InvalidOperationException();
+            _errorContent = errorContent ?? "";
+        } finally {
+            RestResponseState.Unlock();
+        }
+    }
+
+    public T GetValue() {
+        RestResponseState.Lock();
+        if (_disposed) {
+            RestResponseState.Unlock();
+            throw new ObjectDisposedException("RestResponse");
+        }
+        if (!_hasValue) {
+            RestResponseState.Unlock();
+            throw new InvalidOperationException(
+                "This REST response has no materialized value.");
+        }
+        T value = _value;
+        RestResponseState.Unlock();
+        return value;
+    }
+
+    public void Dispose() {
+        HttpResponseMessage response = null;
+        RestResponseState.Lock();
+        try {
+            if (_disposed) return;
+            _disposed = true;
+            response = _response;
+            _response = null;
+            _value = default;
+            _errorContent = "";
+        } finally {
+            RestResponseState.Unlock();
+        }
+        if (response != null) response.Dispose();
+    }
+
+}

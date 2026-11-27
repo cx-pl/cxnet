@@ -1,0 +1,109 @@
+import System;
+import System.Threading;
+
+namespace System.Net.Http;
+
+public final class HttpResponseMessage : IDisposable {
+    private Mutex _stateMutex;
+    private bool _disposed;
+
+    public HttpStatusCode StatusCode { get; set; }
+    public string ReasonPhrase { get; set; }
+    public string Version { get; set; }
+    public HttpContent Content {
+        get {
+            _stateMutex.Lock();
+            try { return _content; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try {
+                if (_disposed) {
+                    throw new ObjectDisposedException("response");
+                }
+                _content = value;
+            } finally {
+                _stateMutex.Unlock();
+            }
+        }
+    }
+    public HttpHeaders Headers { const get => _headers; }
+    private HttpContent _content;
+    private HttpHeaders _headers;
+    private System.IDisposable _sendLifetime;
+
+    public bool IsSuccessStatusCode {
+        get {
+            int statusCode = (int)StatusCode;
+            return statusCode >= 200 && statusCode < 300;
+        }
+    }
+
+    public constructor() : this(HttpStatusCode.OK) { }
+
+    public constructor(HttpStatusCode statusCode) {
+        StatusCode = statusCode;
+        ReasonPhrase = "";
+        Version = "1.1";
+        _content = null;
+        _headers = new HttpHeaders();
+        _stateMutex = new Mutex();
+    }
+
+    public void EnsureSuccessStatusCode() {
+        if (!IsSuccessStatusCode) {
+            throw new HttpRequestException(StatusCode,
+                "Response status code does not indicate success.");
+        }
+    }
+
+    internal void SetSendLifetime(System.IDisposable lifetime) {
+        System.IDisposable previousLifetime = null;
+        bool disposeLifetime = false;
+        _stateMutex.Lock();
+        try {
+            if (_disposed) {
+                disposeLifetime = true;
+            } else {
+                previousLifetime = _sendLifetime;
+                _sendLifetime = lifetime;
+            }
+        } finally {
+            _stateMutex.Unlock();
+        }
+        if (previousLifetime != null) previousLifetime.Dispose();
+        if (disposeLifetime && lifetime != null) lifetime.Dispose();
+    }
+
+    public void Dispose() {
+        System.IDisposable sendLifetime = null;
+        HttpContent content = null;
+        bool shouldDispose = false;
+        _stateMutex.Lock();
+        try {
+            if (!_disposed) {
+                _disposed = true;
+                sendLifetime = _sendLifetime;
+                _sendLifetime = null;
+                content = _content;
+                shouldDispose = true;
+            }
+        } finally {
+            _stateMutex.Unlock();
+        }
+        if (!shouldDispose) return;
+        System.Exception firstException = null;
+        try {
+            if (content != null) content.Dispose();
+        } catch (System.Exception exception) {
+            firstException = exception;
+        }
+        try {
+            if (sendLifetime != null) sendLifetime.Dispose();
+        } catch (System.Exception exception) {
+            if (firstException == null) firstException = exception;
+        }
+        if (firstException != null) throw firstException;
+    }
+}

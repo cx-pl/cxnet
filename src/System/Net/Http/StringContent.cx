@@ -1,0 +1,20 @@
+namespace System.Net.Http;
+
+public final class StringContent : ByteArrayContent {
+    public constructor(string content)
+        : this(content, "text/plain; charset=utf-8") { }
+
+    public constructor(string content, string mediaType)
+        : base(HttpTextEncoding.Encode(content,
+            HttpTextEncoding.GetCharsetFromContentType(mediaType))) {
+        if (mediaType == null) throw new System.ArgumentNullException("mediaType");
+        Headers.Add("Content-Type", mediaType);
+    }
+
+    public constructor(string content, string mediaType, string charset)
+        : base(HttpTextEncoding.Encode(content, charset)) {
+        if (mediaType == null) throw new System.ArgumentNullException("mediaType");
+        if (charset == null) throw new System.ArgumentNullException("charset");
+        Headers.Add("Content-Type", HttpTextEncoding.AddCharset(mediaType, charset));
+    }
+}

@@ -1,0 +1,217 @@
+import System.Collections;
+import System.Net.Sockets;
+import System.Threading.Tasks;
+
+namespace Examples.StreamingRead;
+
+// A synchronous producer used by the native allocation check. Its enumerator
+// owns one reusable move source, so completed moves should not allocate per item.
+public async IAsyncEnumerable<byte> ImmediateBytes(int count) {
+    for (int value = 0; value < count; value++) {
+        yield return (byte)value;
+    }
+}
+
+// This adapter sees and forwards each byte as it arrives. Its consumer can
+// process a value before the peer closes the stream.
+public async IAsyncEnumerable<byte> ObserveBytesAsync(
+    Socket socket,
+    byte[] buffer,
+    uint offset,
+    uint count,
+    CancellationToken cancellationToken) {
+    try {
+        await foreach (byte value in socket.ReadBytesAsync(
+            buffer, offset, count, cancellationToken)) {
+            yield return value;
+        }
+    } finally {
+        StreamingReadSession.Finalizers += 1;
+    }
+}
+
+public async IAsyncEnumerable<byte> ObserveBytesWithSourceAsync(
+    Socket socket,
+    byte[] buffer,
+    uint offset,
+    uint count,
+    CancellationToken cancellationToken,
+    ReusableValueTaskSource<uint> readCompletion) {
+    try {
+        await foreach (byte value in socket.ReadBytesAsyncWithSource(
+            buffer, offset, count, cancellationToken, readCompletion)) {
+            yield return value;
+        }
+    } finally {
+        StreamingReadSession.Finalizers += 1;
+    }
+}
+
+// Public session methods keep native clients behind the generated project ABI;
+// the compiler-generated iterator type remains private to this module.
+public class StreamingReadSession {
+    private IAsyncEnumerator<byte> _enumerator;
+    private CancellationTokenSource _cancellationSource;
+    private ReusableValueTaskSource<uint> _readCompletion;
+    private Socket _readSocket;
+    private byte[] _readBuffer;
+    private uint _readOffset;
+    private uint _readCount;
+    private ValueTask<bool> _move;
+    private bool _moveWasCanceled;
+    public static int Finalizers;
+
+    public constructor(IAsyncEnumerator<byte> enumerator) {
+        _enumerator = enumerator;
+    }
+
+    public static StreamingReadSession Create(
+        Socket socket, byte[] buffer, uint offset, uint count,
+        CancellationToken cancellationToken) {
+        IAsyncEnumerator<byte> enumerator = ObserveBytesAsync(
+            socket, buffer, offset, count, cancellationToken)
+            .GetAsyncEnumerator(cancellationToken);
+        return new StreamingReadSession(enumerator);
+    }
+
+    public static StreamingReadSession CreateImmediate(int count) {
+        IAsyncEnumerator<byte> enumerator = ImmediateBytes(count)
+            .GetAsyncEnumerator(CancellationToken.None);
+        return new StreamingReadSession(enumerator);
+    }
+
+    public static StreamingReadSession CreateCancelable(
+        Socket socket, byte[] buffer, uint offset, uint count) {
+        CancellationTokenSource source = new CancellationTokenSource();
+        StreamingReadSession session = Create(
+            socket, buffer, offset, count, source.Token);
+        session._cancellationSource = source;
+        return session;
+    }
+
+    public static StreamingReadSession CreateCancelableWithOwnedReadSource(
+        Socket socket, byte[] buffer, uint offset, uint count) {
+        CancellationTokenSource source = new CancellationTokenSource();
+        ReusableValueTaskSource<uint> readCompletion =
+            new ReusableValueTaskSource<uint>();
+        IAsyncEnumerator<byte> enumerator = ObserveBytesWithSourceAsync(
+            socket, buffer, offset, count, source.Token, readCompletion)
+            .GetAsyncEnumerator(source.Token);
+        StreamingReadSession session = new StreamingReadSession(enumerator);
+        session._cancellationSource = source;
+        session._readCompletion = readCompletion;
+        session._readSocket = socket;
+        session._readBuffer = buffer;
+        session._readOffset = offset;
+        session._readCount = count;
+        return session;
+    }
+
+    public void RestartWithReadSource() {
+        _enumerator.DisposeAsync().GetResult();
+        IAsyncEnumerator<byte> enumerator = ObserveBytesWithSourceAsync(
+            _readSocket, _readBuffer, _readOffset, _readCount,
+            CancellationToken.None, _readCompletion)
+            .GetAsyncEnumerator(CancellationToken.None);
+        _enumerator = enumerator;
+    }
+
+    public bool TryResetReadCompletion() {
+        try {
+            _readCompletion.Reset();
+            return true;
+        } catch (Exception) {
+            return false;
+        }
+    }
+
+    public bool ConsumeReadCompletion() {
+        try {
+            _readCompletion.GetResult(_readCompletion.GetVersion());
+            return true;
+        } catch (OperationCanceledException) {
+            return true;
+        } catch (Exception) {
+            return false;
+        }
+    }
+
+    public void Cancel() {
+        _cancellationSource.Cancel();
+    }
+
+    public static void ResetFinalizers() {
+        Finalizers = 0;
+    }
+
+    public bool MoveNextAsync() {
+        _moveWasCanceled = false;
+        _move = _enumerator.MoveNextAsync();
+        return _move.IsCompleted;
+    }
+
+    public bool MoveResult() {
+        try {
+            return _move.GetResult();
+        } catch (OperationCanceledException) {
+            _moveWasCanceled = true;
+            return false;
+        }
+    }
+
+    public bool MoveIsCompleted() {
+        return _move.IsCompleted;
+    }
+
+    public bool MoveIsCanceled() {
+        return _moveWasCanceled;
+    }
+
+    public byte Current { const get { return _enumerator.Current; } }
+
+    public void Dispose() {
+        _enumerator.DisposeAsync().GetResult();
+    }
+}
+
+// Native ABI probe for the public Task<uint> Socket.ReadAsync contract.
+public class SocketTaskReadSession {
+    private Task<uint> _read;
+    private byte[] _buffer;
+
+    public static SocketTaskReadSession Create(Socket socket, byte[] buffer) {
+        SocketTaskReadSession session = new SocketTaskReadSession();
+        session._buffer = buffer;
+        session._read = socket.ReadAsync(buffer, 0u, 8u);
+        return session;
+    }
+
+    public static bool NoneIsCanceled() {
+        CancellationToken token = CancellationToken.None;
+        return token.IsCancellationRequested;
+    }
+
+    public bool IsCompleted() { return _read.IsCompleted; }
+    public bool IsCanceled() { return _read.IsCanceled; }
+    public uint GetResult() { return _read.GetResult(); }
+    public byte GetByte() { return _buffer[0u]; }
+}
+
+// Native performance probe for the generated Task<uint> Socket.WriteAsync API.
+public class SocketTaskWriteSession {
+    private Socket _socket;
+    private Task<uint> _write;
+
+    public constructor(Socket socket) { _socket = socket; }
+
+    public static SocketTaskWriteSession Create(Socket socket) {
+        return new SocketTaskWriteSession(socket);
+    }
+
+    public void StartWrite(byte[] buffer, uint count) {
+        _write = _socket.WriteAsync(buffer, 0u, count);
+    }
+
+    public bool IsCompleted() { return _write.IsCompleted; }
+    public uint GetResult() { return _write.GetResult(); }
+}

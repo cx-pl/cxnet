@@ -1,0 +1,196 @@
+import System;
+import System.Net;
+import System.Threading;
+
+namespace System.Net.Http;
+
+public final class HttpRequestMessage : IDisposable {
+    private static extern bool ShouldInjectEndSendFailure();
+
+    private Mutex _stateMutex;
+    private bool _disposed;
+    private bool _sendInProgress;
+
+    public HttpMethod Method {
+        get {
+            _stateMutex.Lock();
+            try { return _method; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try {
+                EnsureMutableLocked();
+                _method = value;
+            } finally {
+                _stateMutex.Unlock();
+            }
+        }
+    }
+    public Uri RequestUri {
+        get {
+            _stateMutex.Lock();
+            try { return _requestUri; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try {
+                EnsureMutableLocked();
+                _requestUri = value;
+            } finally {
+                _stateMutex.Unlock();
+            }
+        }
+    }
+    public HttpContent Content {
+        get {
+            _stateMutex.Lock();
+            try { return _content; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try {
+                EnsureMutableLocked();
+                _content = value;
+            } finally {
+                _stateMutex.Unlock();
+            }
+        }
+    }
+    public HttpHeaders Headers { const get => _headers; }
+    internal uint TransportTimeoutMilliseconds { get; set; }
+    internal string TransportProxy { get; set; }
+    internal string TransportProxyBypassList { get; set; }
+    internal string TransportProxyUsername { get; set; }
+    internal string TransportProxyPassword { get; set; }
+    internal HttpHeaders TransportDefaultHeaders { get; set; }
+    internal HttpHeaders TransportRequestHeaders { get; set; }
+    internal HttpHeaders TransportContentHeaders { get; set; }
+    internal CookieContainer TransportCookieContainer { get; set; }
+    internal bool TransportUseCookies { get; set; }
+    internal bool TransportCookieHeaderIsGenerated { get; set; }
+    internal bool TransportResponseHeadersRead { get; set; }
+    internal uint TransportMaxResponseContentBufferSize { get; set; }
+    internal uint TransportMaxConnectionsPerServer { get; set; }
+    internal uint TransportPooledConnectionIdleTimeoutMilliseconds { get; set; }
+    internal uint TransportPooledConnectionLifetimeMilliseconds { get; set; }
+    private HttpHeaders _headers;
+    private HttpContent _content;
+    private HttpMethod _method;
+    private Uri _requestUri;
+
+    public constructor(HttpMethod method, Uri requestUri) {
+        if (method == null) throw new ArgumentNullException("method");
+        if (requestUri == null) throw new ArgumentNullException("requestUri");
+        _stateMutex = new Mutex();
+        _method = method;
+        _requestUri = requestUri;
+        _headers = new HttpHeaders();
+        TransportTimeoutMilliseconds = 100000u;
+        TransportProxy = null;
+        TransportProxyBypassList = null;
+        TransportProxyUsername = null;
+        TransportProxyPassword = null;
+        TransportDefaultHeaders = new HttpHeaders();
+        TransportRequestHeaders = null;
+        TransportContentHeaders = null;
+        TransportCookieContainer = null;
+        TransportUseCookies = false;
+        TransportCookieHeaderIsGenerated = false;
+        TransportResponseHeadersRead = false;
+        TransportMaxResponseContentBufferSize = 0u;
+        TransportMaxConnectionsPerServer = 10u;
+        TransportPooledConnectionIdleTimeoutMilliseconds = 90000u;
+        TransportPooledConnectionLifetimeMilliseconds = 300000u;
+        _content = null;
+        _sendInProgress = false;
+    }
+
+    public constructor(HttpMethod method, string requestUri)
+        : this(method, new Uri(requestUri)) { }
+
+    internal void EnsureOpen() {
+        _stateMutex.Lock();
+        try {
+            EnsureOpenLocked();
+        } finally {
+            _stateMutex.Unlock();
+        }
+    }
+
+    internal void BeginSend(uint timeoutMilliseconds) {
+        _stateMutex.Lock();
+        try {
+            EnsureOpenLocked();
+            if (_sendInProgress) {
+                throw new InvalidOperationException(
+                    "A request message cannot be sent concurrently.");
+            }
+            _sendInProgress = true;
+            TransportTimeoutMilliseconds = timeoutMilliseconds;
+        } finally {
+            _stateMutex.Unlock();
+        }
+    }
+
+    internal void BeginSend(uint timeoutMilliseconds, Uri baseAddress) {
+        _stateMutex.Lock();
+        try {
+            EnsureOpenLocked();
+            if (_sendInProgress) {
+                throw new InvalidOperationException(
+                    "A request message cannot be sent concurrently.");
+            }
+            if (!_requestUri.IsAbsoluteUri) {
+                if (baseAddress == null) {
+                    throw new InvalidOperationException(
+                        "A relative request URI requires BaseAddress.");
+                }
+                _requestUri = new Uri(baseAddress, _requestUri.ToString());
+            }
+            _sendInProgress = true;
+            TransportTimeoutMilliseconds = timeoutMilliseconds;
+        } finally {
+            _stateMutex.Unlock();
+        }
+    }
+
+    private void EnsureOpenLocked() {
+        if (_disposed) throw new ObjectDisposedException("HttpRequestMessage");
+        if (_method == null) throw new InvalidOperationException("Request method is required.");
+        if (_requestUri == null) throw new InvalidOperationException("Request URI is required.");
+    }
+
+    private void EnsureMutableLocked() {
+        if (_disposed) throw new ObjectDisposedException("HttpRequestMessage");
+        if (_sendInProgress) throw new InvalidOperationException();
+    }
+
+    internal void EndSend() {
+        if (ShouldInjectEndSendFailure()) {
+            throw new InvalidOperationException(
+                "Injected redirected request EndSend failure.");
+        }
+        _stateMutex.Lock();
+        try { _sendInProgress = false; }
+        finally { _stateMutex.Unlock(); }
+    }
+
+    private HttpContent MarkDisposedAndGetContent() {
+        _stateMutex.Lock();
+        try {
+            if (_disposed) return null;
+            _disposed = true;
+            return _content;
+        } finally {
+            _stateMutex.Unlock();
+        }
+    }
+
+    public void Dispose() {
+        HttpContent content = MarkDisposedAndGetContent();
+        if (content != null) content.Dispose();
+    }
+}

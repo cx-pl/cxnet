@@ -1,0 +1,112 @@
+import System;
+import System.Collections;
+import System.IO;
+import System.Net;
+import System.Net.Sockets;
+import System.Threading.Tasks;
+
+namespace Examples.TcpEcho;
+
+public void RunLoopbackExchange() {
+        IPAddress loopback = IPAddress.Loopback;
+        IPEndPoint requestedEndpoint = new IPEndPoint(loopback, 0);
+        Socket listener = new Socket(
+            AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(requestedEndpoint);
+        listener.Listen(16);
+        int port = listener.GetLocalEndPoint().Port;
+
+        Socket client = new Socket(
+            AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        Task<Socket> acceptTask = listener.AcceptAsync();
+        Task connectTask = client.ConnectAsync(new IPEndPoint(loopback, port));
+        TaskScheduler.RunUntil(connectTask);
+        connectTask.GetResult();
+        TaskScheduler.RunUntil(acceptTask);
+        Socket accepted = acceptTask.GetResult();
+
+        byte[] outgoing = new byte[4u];
+        outgoing[0u] = (byte)'p';
+        outgoing[1u] = (byte)'i';
+        outgoing[2u] = (byte)'n';
+        outgoing[3u] = (byte)'g';
+        NetworkStream clientStream = new NetworkStream(client, false);
+        byte[] incoming = new byte[4u];
+        NetworkStream acceptedStream = new NetworkStream(accepted, false);
+        Task<uint> readTask = acceptedStream.ReadAsync(
+            incoming, 0u, incoming.Length);
+        Task writeTask = clientStream.WriteAsync(
+            outgoing, 0u, 2u);
+        TaskScheduler.RunUntil(writeTask);
+        writeTask.GetResult();
+        TaskScheduler.RunUntil(readTask);
+        uint received = readTask.GetResult();
+        if (received == 0u || received >= incoming.Length) {
+            throw new InvalidOperationException(
+                "The TCP echo fixture did not produce a partial read.");
+        }
+        writeTask = clientStream.WriteAsync(
+            outgoing, 2u, outgoing.Length - 2u);
+        TaskScheduler.RunUntil(writeTask);
+        writeTask.GetResult();
+        while (received < incoming.Length) {
+            readTask = acceptedStream.ReadAsync(
+                incoming, received, incoming.Length - received);
+            TaskScheduler.RunUntil(readTask);
+            uint count = readTask.GetResult();
+            if (count == 0u) {
+                throw new InvalidOperationException(
+                    "The TCP echo peer closed before sending the payload.");
+            }
+            received += count;
+            if (received < incoming.Length) {
+                readTask = acceptedStream.ReadAsync(
+                    incoming, received, incoming.Length - received);
+            }
+        }
+        if (incoming[0u] != (byte)'p' ||
+            incoming[1u] != (byte)'i' || incoming[2u] != (byte)'n' ||
+            incoming[3u] != (byte)'g') {
+            throw new InvalidOperationException("The TCP echo exchange failed.");
+        }
+
+        Task echoWriteTask = acceptedStream.WriteAsync(
+            incoming, 0u, incoming.Length);
+        TaskScheduler.RunUntil(echoWriteTask);
+        echoWriteTask.GetResult();
+        byte[] echoed = new byte[4u];
+        Task<uint> echoReadTask = clientStream.ReadAsync(
+            echoed, 0u, echoed.Length);
+        uint echoReceived = 0u;
+        while (echoReceived < echoed.Length) {
+            TaskScheduler.RunUntil(echoReadTask);
+            uint count = echoReadTask.GetResult();
+            if (count == 0u) {
+                throw new InvalidOperationException(
+                    "The TCP echo server closed before returning the payload.");
+            }
+            echoReceived += count;
+            if (echoReceived < echoed.Length) {
+                echoReadTask = clientStream.ReadAsync(
+                    echoed, echoReceived, echoed.Length - echoReceived);
+            }
+        }
+        if (echoed[0u] != incoming[0u] || echoed[1u] != incoming[1u] ||
+            echoed[2u] != incoming[2u] || echoed[3u] != incoming[3u]) {
+            throw new InvalidOperationException("The TCP echo payload changed.");
+        }
+
+        IDisposable clientDisposable = clientStream;
+        IDisposable acceptedDisposable = acceptedStream;
+        clientDisposable.Dispose();
+        acceptedDisposable.Dispose();
+        client.Dispose();
+        accepted.Dispose();
+        listener.Dispose();
+}
+
+public int Main() {
+    RunLoopbackExchange();
+    Console.WriteLine("tcp echo pass");
+    return 0;
+}

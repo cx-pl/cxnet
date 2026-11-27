@@ -1,0 +1,43 @@
+import System.Collections;
+
+namespace System.Net.Http;
+
+public final class FormUrlEncodedContent : ByteArrayContent {
+    public constructor(List<HttpHeader> values)
+        : base(Encode(values)) {
+        Headers.Add("Content-Type", "application/x-www-form-urlencoded");
+    }
+
+    private static byte[] Encode(List<HttpHeader> values) {
+        if (values == null) throw new System.ArgumentNullException("values");
+        System.StringBuilder builder = new System.StringBuilder();
+        for (uint index = 0u; index < values.Count; index += 1u) {
+            if (index != 0u) builder.Append('&');
+            HttpHeader pair = values.Get(index);
+            AppendComponent(builder, pair.Name);
+            builder.Append('=');
+            AppendComponent(builder, pair.Value);
+        }
+        return HttpUtf8.Encode(builder.ToString());
+    }
+
+    private static void AppendComponent(System.StringBuilder builder, string value) {
+        if (value == null) throw new System.ArgumentNullException("value");
+        byte[] bytes = HttpUtf8.Encode(value);
+        const string hex = "0123456789ABCDEF";
+        for (uint index = 0u; index < bytes.Length; index += 1u) {
+            uint current = (uint)bytes[index];
+            if ((current >= 'A' && current <= 'Z') || (current >= 'a' && current <= 'z') ||
+                (current >= '0' && current <= '9') || current == '-' || current == '_' ||
+                current == '.' || current == '*') {
+                builder.Append((char)current);
+            } else if (current == ' ') {
+                builder.Append('+');
+            } else {
+                builder.Append('%');
+                builder.Append(hex.Item[current >> 4u]);
+                builder.Append(hex.Item[current & 15u]);
+            }
+        }
+    }
+}

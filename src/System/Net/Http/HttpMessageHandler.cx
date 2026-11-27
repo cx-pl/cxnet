@@ -1,0 +1,67 @@
+import System;
+import System.Threading;
+import System.Threading.Tasks;
+
+namespace System.Net.Http;
+
+public abstract class HttpMessageHandler : System.IDisposable {
+    private bool _disposed;
+
+    public constructor() {}
+
+    protected void EnsureHandlerOpen() {
+        if (_disposed) throw new System.ObjectDisposedException("HttpMessageHandler");
+    }
+
+    protected void MarkHandlerDisposed() { _disposed = true; }
+
+    public abstract Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken);
+
+    public virtual void Dispose() { MarkHandlerDisposed(); }
+}
+
+public abstract class DelegatingHandler : HttpMessageHandler {
+    private HttpMessageHandler _innerHandler;
+    private bool _disposed;
+
+    public HttpMessageHandler InnerHandler {
+        get { EnsureHandlerOpen(); return _innerHandler; }
+        set {
+            EnsureHandlerOpen();
+            ValidateInnerHandler(_innerHandler, value);
+            if (value == null) throw new System.ArgumentNullException("value");
+            _innerHandler = value;
+        }
+    }
+
+    private void ValidateInnerHandler(HttpMessageHandler current, HttpMessageHandler value) {
+        if (current != null) throw new System.InvalidOperationException("InnerHandler can only be assigned once.");
+        HttpMessageHandler candidate = value;
+        while (candidate != null) {
+            if (Object.ReferenceEquals(candidate, this)) {
+                throw new System.InvalidOperationException(
+                    "A delegating-handler pipeline cannot contain a cycle.");
+            }
+            if (!(candidate is DelegatingHandler)) break;
+            candidate = ((DelegatingHandler)candidate)._innerHandler;
+        }
+    }
+
+    public override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        EnsureHandlerOpen();
+        if (_innerHandler == null) throw new System.InvalidOperationException("InnerHandler is not configured.");
+        return _innerHandler.SendAsync(request, cancellationToken);
+    }
+
+    public override void Dispose() {
+        if (_disposed) return;
+        _disposed = true;
+        try {
+            if (_innerHandler != null) _innerHandler.Dispose();
+        } finally {
+            MarkHandlerDisposed();
+        }
+    }
+}

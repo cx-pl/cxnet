@@ -1,0 +1,46 @@
+import System;
+import System.Net.Http;
+import System.Threading.Tasks;
+import M26ConsumerX86;
+
+namespace M26WindowsPackageHttpSmokeX86;
+
+public int Main(string[] args) {
+    if (args.Length < 2u || args.Length > 4u) {
+        Console.WriteLine(
+            "usage: M26WindowsPackageHttpSmokeX86 <url> <expected-body> " +
+            "[ca-file] [expect-tls-failure]");
+        return 2;
+    }
+
+    bool expectTlsFailure = args.Length == 4u &&
+        args[3u] == "expect-tls-failure";
+    HttpConsumerX86 consumer = new HttpConsumerX86();
+    HttpClient client = args.Length >= 3u
+        ? consumer.CreateClient(args[2u]) : consumer.CreateClient();
+    HttpResponseMessage response = null;
+    try {
+        Task<HttpResponseMessage> responseTask = client.GetAsync(
+            new Uri(args[0u]));
+        try {
+            TaskScheduler.RunUntil(responseTask);
+            response = responseTask.GetResult();
+        } catch (Exception) {
+            if (!expectTlsFailure) throw;
+            Console.WriteLine("package-only Windows x86 HTTPS rejection passed");
+            return 0;
+        }
+        if (expectTlsFailure) return 5;
+        if (response.StatusCode != HttpStatusCode.OK) return 3;
+
+        Task<string> bodyTask = response.Content.ReadAsStringAsync();
+        TaskScheduler.RunUntil(bodyTask);
+        if (bodyTask.GetResult() != args[1u]) return 4;
+
+        Console.WriteLine("package-only Windows x86 HTTP GET passed");
+        return 0;
+    } finally {
+        if (response != null) response.Dispose();
+        client.Dispose();
+    }
+}

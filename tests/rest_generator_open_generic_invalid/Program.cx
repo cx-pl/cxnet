@@ -1,0 +1,18 @@
+import System.Net.Http.Rest;
+import System.Threading.Tasks;
+
+public interface OpenGenericContract<T> {
+    @Get("/open-generic")
+    Task<string> Get();
+}
+
+public static class OpenGenericCaller<T> {
+    public static RestClient Client = RestClient.For<OpenGenericContract<T>>();
+}
+
+public static class Program {
+    public static int Main() {
+        RestClient client = OpenGenericCaller<string>.Client;
+        return 0;
+    }
+}

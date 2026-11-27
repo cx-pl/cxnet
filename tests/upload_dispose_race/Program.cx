@@ -1,0 +1,144 @@
+import System;
+import System.IO;
+import System.Net.Http;
+import System.Threading;
+import System.Threading.Tasks;
+
+namespace UploadDisposeRace;
+
+public final class GatedReadStream : Stream {
+    private Task<uint> _readTask;
+    private uint _readCalls;
+    private bool _readStarted;
+    private bool _disposed;
+    private bool _observerRan;
+    public uint DisposeCount;
+
+    public constructor() {
+        _readTask = new Task<uint>();
+        _readCalls = 0u;
+        _readStarted = false;
+        _disposed = false;
+        _observerRan = false;
+        DisposeCount = 0u;
+    }
+
+    public bool ReadStarted { const get => _readStarted; }
+    public bool WasDisposed { const get => _disposed; }
+    public bool ObserverRan { const get => _observerRan; }
+
+    public override bool CanRead { get => true; }
+    public override bool CanWrite { get => false; }
+    public override void Flush() { }
+
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset,
+        uint count, CancellationToken cancellationToken) {
+        _readCalls += 1u;
+        if (_readCalls == 1u) {
+            buffer[offset] = (byte)'u';
+            return new Task<uint>(1u);
+        }
+        _readStarted = true;
+        return _readTask;
+    }
+
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+
+    public override void Dispose() {
+        DisposeCount += 1u;
+        _disposed = true;
+    }
+
+    public void ObserveReadCompletion() {
+        GatedReadStream stream = this;
+        _readTask.OnCompleted(() => { stream._observerRan = true; });
+    }
+
+    public void CompleteReadAfterDispose() {
+        _readTask.SetResult(1u);
+    }
+}
+
+public int Main(string[] args) {
+    if (args == null || args.Length != 1u) return 1;
+
+    GatedReadStream stream = new GatedReadStream();
+    StreamContent content = new StreamContent(stream);
+    HttpRequestMessage request = new HttpRequestMessage(
+        new HttpMethod("POST"), new Uri(args[0]));
+    request.Content = content;
+    HttpClient client = new HttpClient();
+    Task<HttpResponseMessage> send = client.SendAsync(request);
+
+    uint startSteps = 0u;
+    while (!stream.ReadStarted && !send.IsCompleted &&
+        startSteps < 100000u) {
+        if (!TaskScheduler.RunOne()) Thread.Yield();
+        startSteps += 1u;
+    }
+
+    // The Python peer releases this gate only after accepting the TCP socket.
+    // Keep pumping socket readiness while a worker waits for the pipe signal.
+    if (!stream.ReadStarted || send.IsCompleted) return 2;
+    AtomicInt gateReleased = new AtomicInt(0);
+    Thread gateThread = Thread.Start(() => {
+        Console.ReadLine();
+        TaskScheduler.PostFromThread(() => { gateReleased.Exchange(1); });
+    });
+    uint gateSteps = 0u;
+    while (gateReleased.Value == 0 && gateSteps < 100000u) {
+        if (!TaskScheduler.RunOne()) Thread.Yield();
+        gateSteps += 1u;
+    }
+    gateThread.Join();
+    if (gateReleased.Value == 0) return 5;
+
+    client.Dispose();
+    content.Dispose();
+    if (!stream.WasDisposed || stream.DisposeCount != 1u ||
+        stream.ObserverRan) return 3;
+
+    stream.ObserveReadCompletion();
+    stream.CompleteReadAfterDispose();
+    uint steps = 0u;
+    bool schedulerFailure = false;
+    while ((!send.IsCompleted || !stream.ObserverRan) && steps < 100000u) {
+        try {
+            if (!TaskScheduler.RunOne()) Thread.Yield();
+        } catch (Exception) {
+            schedulerFailure = true;
+            break;
+        }
+        steps += 1u;
+    }
+
+    if (schedulerFailure) {
+        try { send.GetResult(); }
+        catch (Exception exception) { Console.WriteLine(exception.ToString()); }
+        request.Dispose();
+        return 6;
+    }
+    if (send.IsFaulted) {
+        try { send.GetResult(); }
+        catch (Exception exception) { Console.WriteLine(exception.ToString()); }
+        request.Dispose();
+        return 7;
+    }
+    request.Dispose();
+    return send.IsCanceled && stream.WasDisposed &&
+        stream.DisposeCount == 1u && stream.ObserverRan ? 0 : 4;
+}

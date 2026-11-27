@@ -1,0 +1,14 @@
+import System.Reflection;
+
+namespace System.Net.Http.Rest;
+
+internal final class RestContractFactory {
+    internal TypeInfo ContractType;
+    internal delegate(RestClient) => object Create;
+
+    internal constructor(TypeInfo contractType,
+        delegate(RestClient) => object create) {
+        ContractType = contractType;
+        Create = create;
+    }
+}

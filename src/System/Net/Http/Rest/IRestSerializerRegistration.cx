@@ -1,0 +1,10 @@
+import System.Reflection;
+
+namespace System.Net.Http.Rest;
+
+public interface IRestSerializerRegistration {
+    TypeInfo ValueType { const get; }
+    string ContentType { const get; }
+    string Serialize(object value, object options);
+    object Deserialize(string content, object options);
+}

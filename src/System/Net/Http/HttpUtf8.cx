@@ -1,0 +1,76 @@
+namespace System.Net.Http;
+
+internal static class HttpUtf8 {
+    public static string Decode(byte[] bytes) {
+        System.StringBuilder result = new System.StringBuilder(bytes.Length);
+        uint index = 0u;
+        while (index < bytes.Length) {
+            uint start = index;
+            uint first = (uint)bytes[index];
+            index += 1u;
+            if (first < 0x80u) {
+                result.Append((char)first);
+            } else {
+                uint scalar;
+                uint count;
+                uint minimum;
+                if ((first & 0xE0u) == 0xC0u) {
+                    scalar = first & 0x1Fu; count = 1u; minimum = 0x80u;
+                } else if ((first & 0xF0u) == 0xE0u) {
+                    scalar = first & 0x0Fu; count = 2u; minimum = 0x800u;
+                } else if ((first & 0xF8u) == 0xF0u) {
+                    scalar = first & 7u; count = 3u; minimum = 0x10000u;
+                } else {
+                    throw new System.EncodingException("Invalid UTF-8 content.", start);
+                }
+                for (uint continuation = 0u; continuation < count; continuation += 1u) {
+                    if (index >= bytes.Length) throw new System.EncodingException("Invalid UTF-8 content.", start);
+                    uint next = (uint)bytes[index];
+                    if ((next & 0xC0u) != 0x80u) throw new System.EncodingException("Invalid UTF-8 content.", index);
+                    scalar = (scalar << 6u) | (next & 0x3Fu);
+                    index += 1u;
+                }
+                if (scalar < minimum || scalar > 0x10FFFFu ||
+                    (scalar >= 0xD800u && scalar <= 0xDFFFu)) {
+                    throw new System.EncodingException("Invalid UTF-8 content.", start);
+                }
+                result.Append((char)scalar);
+            }
+        }
+        return result.ToString();
+    }
+
+    public static byte[] Encode(string value) {
+        if (value == null) throw new System.ArgumentNullException("value");
+        uint length = 0u;
+        for (uint index = 0u; index < value.Length; index += 1u) {
+            uint code = (uint)value.Item[index];
+            if (code > 0x10FFFFu || (code >= 0xD800u && code <= 0xDFFFu)) {
+                throw new System.EncodingException("Invalid Unicode scalar in HTTP content.", index);
+            }
+            if (code < 0x80u) length += 1u;
+            else if (code < 0x800u) length += 2u;
+            else if (code < 0x10000u) length += 3u;
+            else length += 4u;
+        }
+        byte[] bytes = new byte[length];
+        uint output = 0u;
+        for (uint index = 0u; index < value.Length; index += 1u) {
+            uint code = (uint)value.Item[index];
+            if (code < 0x80u) { bytes[output] = (byte)code; output += 1u; }
+            else if (code < 0x800u) {
+                bytes[output] = (byte)(0xC0u | (code >> 6u)); bytes[output + 1u] = (byte)(0x80u | (code & 0x3Fu)); output += 2u;
+            } else if (code < 0x10000u) {
+                bytes[output] = (byte)(0xE0u | (code >> 12u)); bytes[output + 1u] = (byte)(0x80u | ((code >> 6u) & 0x3Fu));
+                bytes[output + 2u] = (byte)(0x80u | (code & 0x3Fu)); output += 3u;
+            } else {
+                bytes[output] = (byte)(0xF0u | (code >> 18u));
+                bytes[output + 1u] = (byte)(0x80u | ((code >> 12u) & 0x3Fu));
+                bytes[output + 2u] = (byte)(0x80u | ((code >> 6u) & 0x3Fu));
+                bytes[output + 3u] = (byte)(0x80u | (code & 0x3Fu));
+                output += 4u;
+            }
+        }
+        return bytes;
+    }
+}

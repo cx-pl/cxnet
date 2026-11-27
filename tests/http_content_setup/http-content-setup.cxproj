@@ -1,0 +1,5 @@
+name: HttpContentSetup
+version: 0.1.0
+type: Executable
+project_references:
+- ../../src/cxnet.cxproj

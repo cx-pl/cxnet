@@ -1,0 +1,372 @@
+import System;
+import System.Net;
+import System.Net.Http;
+import System.Net.Http.Rest;
+import System.Net.Sockets;
+import System.Text;
+import System.Threading;
+import System.Threading.Tasks;
+
+namespace RestCancellationFixture;
+
+public static class NativeTestHooks {
+    public static extern void FailNextSchedulerPost();
+    public static extern bool SchedulerPostFailureWasConsumed();
+    public static extern bool ResponseWasDisposed(HttpResponseMessage response);
+    public static extern bool ContentWasDisposed(HttpContent content);
+}
+
+public interface ICancellationApi {
+    @Get("/pending")
+    Task<HttpResponseMessage> Get(CancellationToken cancellationToken);
+}
+
+public interface IPublicationApi {
+    @Get("/text")
+    Task<PublicationDto> GetText();
+}
+
+public final class PublicationDto {
+    public string Value;
+}
+
+public final class PublicationSerializer : IRestSerializer<PublicationDto> {
+    public string ContentType { const get => "application/x-publication"; }
+
+    public string Serialize(PublicationDto value, object options) {
+        return value.Value;
+    }
+
+    public PublicationDto Deserialize(string content, object options) {
+        NativeTestHooks.FailNextSchedulerPost();
+        PublicationDto value = new PublicationDto();
+        value.Value = content;
+        return value;
+    }
+}
+
+public bool RejectUninitializedResponseAccess() {
+    RestResponse<string> response = new RestResponse<string>("seed");
+    bool statusRejected = false;
+    bool headersRejected = false;
+    bool contentRejected = false;
+    bool successRejected = false;
+    bool hasValueSetterRejected = false;
+    bool errorContentSetterRejected = false;
+    try { HttpStatusCode status = response.StatusCode; }
+    catch (InvalidOperationException) { statusRejected = true; }
+    try { HttpHeaders headers = response.Headers; }
+    catch (InvalidOperationException) { headersRejected = true; }
+    try { HttpContent content = response.Content; }
+    catch (InvalidOperationException) { contentRejected = true; }
+    try { bool success = response.IsSuccessStatusCode; }
+    catch (InvalidOperationException) { successRejected = true; }
+    try { response.SetHasValue(true); }
+    catch (InvalidOperationException) { hasValueSetterRejected = true; }
+    try { response.SetErrorContent("premature"); }
+    catch (InvalidOperationException) { errorContentSetterRejected = true; }
+    bool noValue = !response.HasValue && response.ErrorContent == "";
+    response.Dispose();
+    return statusRejected && headersRejected && contentRejected &&
+        successRejected && hasValueSetterRejected &&
+        errorContentSetterRejected && noValue;
+}
+
+public final class PublicationFailureHandler : HttpMessageHandler {
+    private TaskCompletionSource<HttpResponseMessage> _response;
+    public HttpResponseMessage Response;
+    public HttpContent Content;
+
+    public constructor() {
+        _response = new TaskCompletionSource<HttpResponseMessage>();
+        Response = null;
+        Content = null;
+    }
+
+    public override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        return _response.Task;
+    }
+
+    public void Complete() {
+        HttpResponseMessage response = new HttpResponseMessage(HttpStatusCode.OK);
+        StringContent content = new StringContent("publication-value");
+        content.Headers.Remove("Content-Type");
+        content.Headers.Add("Content-Type", "application/x-publication");
+        Content = content;
+        response.Content = content;
+        Response = response;
+        _response.SetResult(response);
+    }
+}
+
+public bool VerifyExceptionRestoration() {
+    bool rethrowCaught = false;
+    try {
+        try {
+            throw new InvalidOperationException("nested finally rethrow");
+        } catch (InvalidOperationException exception) {
+            try { }
+            finally { throw; }
+        }
+    } catch (InvalidOperationException exception) {
+        rethrowCaught = true;
+    }
+
+    bool rejectedFilterRestored = false;
+    try {
+        throw new InvalidOperationException("rejected catch filter");
+    } catch (InvalidOperationException exception) when (false) {
+        return false;
+    } catch (InvalidOperationException exception) {
+        rejectedFilterRestored = true;
+    }
+    return rethrowCaught && rejectedFilterRestored;
+}
+
+public bool RunGeneratedResultPublicationFailure() {
+    if (!VerifyExceptionRestoration()) return false;
+    PublicationFailureHandler handler = new PublicationFailureHandler();
+    HttpClient http = new HttpClient(handler, false);
+    RestClient rest = RestClient.For<IPublicationApi>(http, false);
+    rest.BaseAddress = new Uri("https://example.test/");
+    PublicationSerializer serializer = new PublicationSerializer();
+    rest.RegisterSerializer(new RestSerializerRegistration<PublicationDto>(
+        typeof(PublicationDto), serializer, serializer.ContentType));
+    IPublicationApi api = rest.GetContract<IPublicationApi>();
+    Task<PublicationDto> pending = api.GetText();
+    if (pending.IsCompleted) return false;
+    AtomicInt continuationRan = new AtomicInt(0);
+    pending.OnCompleted(() => { continuationRan.Exchange(1); });
+    handler.Complete();
+
+    bool dispatchExceptionObserved = false;
+    uint steps = 0u;
+    while (!pending.IsCompleted && steps < 100000u) {
+        try {
+            if (!TaskScheduler.RunOne()) break;
+        } catch (InvalidOperationException) {
+            dispatchExceptionObserved = true;
+        }
+        steps += 1u;
+    }
+    bool passed = pending.IsCompleted && dispatchExceptionObserved &&
+        NativeTestHooks.SchedulerPostFailureWasConsumed() &&
+        continuationRan.Value == 0 &&
+        NativeTestHooks.ResponseWasDisposed(handler.Response) &&
+        NativeTestHooks.ContentWasDisposed(handler.Content);
+    rest.Dispose();
+    http.Dispose();
+    handler.Dispose();
+    return passed;
+}
+
+public final class PendingHandler : HttpMessageHandler {
+    private Task<HttpResponseMessage> _pending;
+    public CancellationToken LastCancellationToken;
+
+    public constructor() {
+        _pending = new Task<HttpResponseMessage>();
+        LastCancellationToken = CancellationToken.None;
+    }
+
+    public override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        Task<HttpResponseMessage> pending = _pending;
+        LastCancellationToken = cancellationToken;
+        cancellationToken.Register(() => pending.SetCanceled());
+        return pending;
+    }
+}
+
+public final class CancelThenSucceedHandler : HttpMessageHandler {
+    private uint _requestCount;
+
+    public override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        _requestCount += 1u;
+        if (_requestCount == 1u) {
+            Task<HttpResponseMessage> pending =
+                new Task<HttpResponseMessage>();
+            cancellationToken.Register(() => pending.SetCanceled());
+            return pending;
+        }
+        return new Task<HttpResponseMessage>(
+            new HttpResponseMessage(HttpStatusCode.OK));
+    }
+}
+
+public bool RunOwnedClientDisposeCancellation() {
+    PendingHandler handler = new PendingHandler();
+    HttpClient http = new HttpClient(handler, false);
+    RestClient rest = RestClient.For<ICancellationApi>(http, true);
+    rest.BaseAddress = new Uri("https://example.test/");
+    ICancellationApi api = rest.GetContract<ICancellationApi>();
+    Task<HttpResponseMessage> pending = api.Get(CancellationToken.None);
+    if (pending.IsCompleted) {
+        rest.Dispose();
+        handler.Dispose();
+        return false;
+    }
+    rest.Dispose();
+    TaskScheduler.RunUntil(pending);
+    bool canceled = pending.IsCanceled;
+    http.Dispose();
+    handler.Dispose();
+    return canceled;
+}
+
+public bool RunCallerCancellationAndDisposeBeforeDispatch() {
+    PendingHandler handler = new PendingHandler();
+    HttpClient http = new HttpClient(handler, false);
+    RestClient rest = RestClient.For<ICancellationApi>(http, true);
+    rest.BaseAddress = new Uri("https://example.test/");
+    ICancellationApi api = rest.GetContract<ICancellationApi>();
+    CancellationTokenSource cancellation = new CancellationTokenSource();
+    Task<HttpResponseMessage> pending = api.Get(cancellation.Token);
+    if (pending.IsCompleted) {
+        rest.Dispose();
+        handler.Dispose();
+        return false;
+    }
+
+    // Queue the caller-token completion, then dispose the owning REST client
+    // before the generated continuation is allowed to run on the scheduler.
+    cancellation.Cancel();
+    if (pending.IsCompleted) {
+        rest.Dispose();
+        handler.Dispose();
+        return false;
+    }
+    rest.Dispose();
+    TaskScheduler.RunUntil(pending);
+    bool canceledOnce = pending.IsCanceled &&
+        handler.LastCancellationToken.IsCancellationRequested;
+    http.Dispose();
+    handler.Dispose();
+    return canceledOnce;
+}
+
+public bool RunGeneratedClientReuseAfterCancellation() {
+    CancelThenSucceedHandler handler = new CancelThenSucceedHandler();
+    HttpClient http = new HttpClient(handler, false);
+    RestClient rest = RestClient.For<ICancellationApi>(http, false);
+    rest.BaseAddress = new Uri("https://example.test/");
+    ICancellationApi api = rest.GetContract<ICancellationApi>();
+    CancellationTokenSource cancellation = new CancellationTokenSource();
+    Task<HttpResponseMessage> canceledPending = api.Get(cancellation.Token);
+    cancellation.Cancel();
+    TaskScheduler.RunUntil(canceledPending);
+    if (!canceledPending.IsCanceled) {
+        rest.Dispose();
+        http.Dispose();
+        handler.Dispose();
+        return false;
+    }
+    Task<HttpResponseMessage> succeedingPending = api.Get(CancellationToken.None);
+    TaskScheduler.RunUntil(succeedingPending);
+    bool reusedSuccessfully = succeedingPending.IsCompleted &&
+        !succeedingPending.IsFaulted && !succeedingPending.IsCanceled;
+    if (reusedSuccessfully) {
+        HttpResponseMessage response = succeedingPending.GetResult();
+        reusedSuccessfully = response.StatusCode == HttpStatusCode.OK;
+        response.Dispose();
+    }
+    rest.Dispose();
+    http.Dispose();
+    handler.Dispose();
+    return reusedSuccessfully;
+}
+
+public bool RunWireCancellation() {
+    IPAddress loopback = IPAddress.Loopback;
+    Socket listener = new Socket(
+        AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+    listener.Bind(new IPEndPoint(loopback, 0));
+    listener.Listen(4);
+    IPEndPoint endpoint = listener.GetLocalEndPoint();
+    StringBuilder uriBuilder = new StringBuilder(64u);
+    string baseAddress = uriBuilder.Append("http://127.0.0.1:")
+        .Append(endpoint.Port).Append('/').ToString();
+
+    HttpClient http = new HttpClient();
+    RestClient rest = RestClient.For<ICancellationApi>(http, false);
+    rest.BaseAddress = new Uri(baseAddress);
+    ICancellationApi api = rest.GetContract<ICancellationApi>();
+    CancellationTokenSource cancellation = new CancellationTokenSource();
+    Task<Socket> accept = listener.AcceptAsync();
+    Task<HttpResponseMessage> pending = api.Get(cancellation.Token);
+    TaskScheduler.RunUntil(accept);
+    Socket peer = accept.GetResult();
+    listener.Dispose();
+
+    NetworkStream peerStream = new NetworkStream(peer, false);
+    byte[] requestBuffer = new byte[1024u];
+    bool headersReceived = false;
+    uint headerSteps = 0u;
+    while (!headersReceived && headerSteps < 100000u) {
+        Task<uint> read = peerStream.ReadAsync(
+            requestBuffer, 0u, requestBuffer.Length);
+        TaskScheduler.RunUntil(read);
+        uint count = read.GetResult();
+        if (count == 0u) return false;
+        if (count >= 4u) {
+            uint index = 3u;
+            while (index < count) {
+                if (requestBuffer[index - 3u] == 13u &&
+                    requestBuffer[index - 2u] == 10u &&
+                    requestBuffer[index - 1u] == 13u &&
+                    requestBuffer[index] == 10u) {
+                    headersReceived = true;
+                    break;
+                }
+                index += 1u;
+            }
+        }
+        headerSteps += 1u;
+    }
+    if (!headersReceived || pending.IsCompleted) return false;
+
+    byte[] probe = new byte[1u];
+    Task<uint> peerClose = peerStream.ReadAsync(probe, 0u, 1u);
+    if (peerClose.IsCompleted) return false;
+    cancellation.Cancel();
+    TaskScheduler.RunUntil(pending);
+    TaskScheduler.RunUntil(peerClose);
+    bool closed = peerClose.GetResult() == 0u;
+    peerStream.Dispose();
+    peer.Dispose();
+    rest.Dispose();
+    http.Dispose();
+    return pending.IsCanceled && closed;
+}
+
+public int Main(string[] args) {
+    if (args.Length == 1u && args[0u] ==
+            "--generated-result-publication-failure") {
+        return RunGeneratedResultPublicationFailure() ? 0 : 4;
+    }
+    if (!RejectUninitializedResponseAccess()) return 3;
+    PendingHandler handler = new PendingHandler();
+    HttpClient http = new HttpClient(handler, false);
+    RestClient rest = RestClient.For<ICancellationApi>(http, false);
+    rest.BaseAddress = new Uri("https://example.test/");
+    ICancellationApi api = rest.GetContract<ICancellationApi>();
+    CancellationTokenSource cancellation = new CancellationTokenSource();
+    Task<HttpResponseMessage> pending = api.Get(cancellation.Token);
+    if (pending.IsCompleted) return 1;
+    cancellation.Cancel();
+    uint steps = 0u;
+    while (!pending.IsCompleted && steps < 100000u) {
+        if (!TaskScheduler.RunOne()) break;
+        steps += 1u;
+    }
+    bool canceled = pending.IsCanceled;
+    rest.Dispose();
+    http.Dispose();
+    handler.Dispose();
+    return canceled && RunOwnedClientDisposeCancellation() &&
+        RunCallerCancellationAndDisposeBeforeDispatch() &&
+        RunGeneratedClientReuseAfterCancellation() &&
+        RunWireCancellation() ? 0 : 2;
+}

@@ -1,0 +1,5 @@
+source_url=https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+version=1.5.7
+sha256=EB33E51F49A15E023950CD7825CA74A4A2B43DB8354825AC24FC1B7EE09E6FA3
+license=BSD-3-Clause OR GPL-2.0
+license_file=LICENSE

@@ -1,0 +1,51 @@
+import System;
+
+namespace System.Net.Http;
+
+public final class HttpMethod : Object {
+    private string _method;
+
+    public string Method { const get => _method; }
+
+    public static HttpMethod Get { const get => CreateGet(); }
+    public static HttpMethod Post { const get => CreatePost(); }
+    public static HttpMethod Put { const get => CreatePut(); }
+    public static HttpMethod Patch { const get => CreatePatch(); }
+    public static HttpMethod Delete { const get => CreateDelete(); }
+    public static HttpMethod Head { const get => CreateHead(); }
+    public static HttpMethod Options { const get => CreateOptions(); }
+
+    private static HttpMethod CreateGet() { return new HttpMethod("GET"); }
+    private static HttpMethod CreatePost() { return new HttpMethod("POST"); }
+    private static HttpMethod CreatePut() { return new HttpMethod("PUT"); }
+    private static HttpMethod CreatePatch() { return new HttpMethod("PATCH"); }
+    private static HttpMethod CreateDelete() { return new HttpMethod("DELETE"); }
+    private static HttpMethod CreateHead() { return new HttpMethod("HEAD"); }
+    private static HttpMethod CreateOptions() { return new HttpMethod("OPTIONS"); }
+
+    public constructor(string method) {
+        if (method == null) throw new System.ArgumentNullException("method");
+        if (method.Length == 0u) {
+            throw new System.ArgumentException("HTTP method cannot be empty.", "method");
+        }
+        for (uint index = 0u; index < method.Length; index += 1u) {
+            char value = method.Item[index];
+            if (!IsTokenCharacter(value)) {
+                throw new System.ArgumentException("HTTP method contains an invalid token character.", "method");
+            }
+        }
+        _method = method;
+    }
+
+    private static bool IsTokenCharacter(char value) {
+        return (value >= 'A' && value <= 'Z') ||
+            (value >= 'a' && value <= 'z') ||
+            (value >= '0' && value <= '9') ||
+            value == '!' || value == '#' || value == '$' || value == '%' ||
+            value == '&' || value == '\'' || value == '*' || value == '+' ||
+            value == '-' || value == '.' || value == '^' || value == '_' ||
+            value == '`' || value == '|' || value == '~';
+    }
+
+    public override string ToString() const { return _method; }
+}

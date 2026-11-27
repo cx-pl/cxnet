@@ -1,0 +1,47 @@
+import System;
+
+namespace System.Net;
+
+public final class IPEndPoint : EndPoint {
+    private IPAddress _address;
+    private ushort _port;
+
+    public IPAddress Address { const get { return _address; } }
+    public ushort Port { const get { return _port; } }
+    public override AddressFamily AddressFamily { const get { return _address.AddressFamily; } }
+
+    public bool Equals(IPEndPoint other) const {
+        return other != null && _port == other._port &&
+            _address.Equals(other._address);
+    }
+
+    public override bool Equals(object other) const {
+        return other is IPEndPoint && Equals((IPEndPoint)other);
+    }
+
+    public override int GetHashCode() const {
+        return _address.GetHashCode() ^ (int)_port;
+    }
+
+    public override string ToString() const {
+        StringBuilder builder = new StringBuilder(64u);
+        if (AddressFamily == AddressFamily.InterNetworkV6) {
+            return builder.Append('[').Append(_address.ToString()).Append(']')
+                .Append(':').Append(_port).ToString();
+        }
+        return builder.Append(_address.ToString()).Append(':').Append(_port).ToString();
+    }
+
+    public constructor(IPAddress address, ushort port) {
+        if (address == null) throw new ArgumentNullException("address");
+        _address = address;
+        _port = port;
+    }
+
+    public constructor(IPAddress address, int port) {
+        if (port < 0 || port > 65535) throw new ArgumentOutOfRangeException("port");
+        if (address == null) throw new ArgumentNullException("address");
+        _address = address;
+        _port = (ushort)port;
+    }
+}

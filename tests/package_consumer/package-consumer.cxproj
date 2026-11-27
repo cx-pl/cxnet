@@ -1,0 +1,8 @@
+name: M26Consumer
+version: 0.1.0
+type: Library
+targets: [linux-x64]
+feeds:
+- ../../../.build/m26-compression-feed-parser
+dependencies:
+- cxnet@^0.1.0

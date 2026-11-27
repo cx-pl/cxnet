@@ -1,0 +1,8 @@
+import System;
+
+namespace System.Net.Http.Rest;
+
+@AnnotationUsage(targets = "class,function", repeatable = true)
+public final class StaticHeader : Annotation {
+    public constructor(string name, string value) {}
+}

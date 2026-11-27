@@ -1,0 +1,20 @@
+{
+  "LockVersion": 1,
+  "ProjectHash": "d07fe8e0e2bf8688f46f0df0eaf967d5e4f6c5cde14387106bfd4e0e2d65c214",
+  "Packages": {
+    "cxnet": {
+      "Id": "cxnet",
+      "Version": "0.1.0",
+      "Sha256": "d0e04e254984930ace605721f7502901e54570a1e758d59824536a5cdb20077d",
+      "Dependencies": [
+        "cxcore@^0.1.0"
+      ]
+    },
+    "cxcore": {
+      "Id": "cxcore",
+      "Version": "0.1.0",
+      "Sha256": "e8d5f9e31a3fa0cf73a60feb4ec3717def373b864c449c7d7cda23fd2aeedf2d",
+      "Dependencies": []
+    }
+  }
+}

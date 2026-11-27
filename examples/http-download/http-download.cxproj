@@ -1,0 +1,4 @@
+name: httpDownload
+type: Executable
+project_references:
+- ../../src/cxnet.cxproj

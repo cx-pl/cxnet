@@ -1,0 +1,253 @@
+import System;
+import System.Net;
+import System.Net.Http;
+import System.Net.Http.Rest;
+import System.Threading;
+import System.Threading.Tasks;
+import System.Data;
+import System.Collections;
+
+namespace Examples.RestCrud;
+
+@Serializable
+public final class Product {
+    public int Id;
+    public string Name;
+
+    public constructor() {}
+}
+
+public interface IProductsApi {
+    @Post("/products")
+    Task<Product> Create(@Body Product product);
+
+    @Get("/products/{id}")
+    Task<Product> Get(@Path("id") int id);
+
+    @Get("/products")
+    Task<const List<Product>> ListProducts();
+
+    @Get("/products/by-id/{id}")
+    Task<HttpResponseMessage> GetByUuid(@Path("id") Uuid id);
+
+    @Get("/products/uuid")
+    Task<Uuid> GetUuidResult();
+
+    @Get("/products/markers/{marker}")
+    Task<char> GetMarker(@Path("marker") char marker,
+        @Query("fallback") char fallback, @Header("X-Marker") char header,
+        @Query("allowed") const List<char> allowed);
+
+    @Get("/products/markers/header-values")
+    Task<HttpResponseMessage> GetConstLinkedListMarkerHeaders(
+        @Header("X-Marker") const LinkedList<string> markers);
+
+    @Get("/products/markers/header-values")
+    Task<HttpResponseMessage> GetConstQueueMarkerHeaders(
+        @Header("X-Marker") const Queue<string> markers);
+
+    @Get("/products/markers/header-values")
+    Task<HttpResponseMessage> GetConstStackMarkerHeaders(
+        @Header("X-Marker") const Stack<string> markers);
+
+    @Post("/products/markers/form")
+    Task SendMarkerForm(@FormField("marker") const List<char> markers);
+
+    @Post("/products/markers/multipart")
+    Task SendMarkerParts(@MultipartPart("marker") const List<char> markers);
+
+    @Put("/products/{id}")
+    Task<Product> Update(@Path("id") int id, @Body Product product);
+
+    @Delete("/products/{id}")
+    Task Delete(@Path("id") int id);
+
+    @Options("/products")
+    Task<HttpResponseMessage> GetOptions();
+}
+
+public final class LocalProductsHandler : HttpMessageHandler {
+    public string LastMethod;
+    public string LastUri;
+    public string LastBody;
+
+    public override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        LastMethod = request.Method.Method;
+        LastUri = request.RequestUri.ToString();
+        LastBody = request.Content == null
+            ? null : request.Content.ReadAsString();
+
+        HttpResponseMessage response;
+        if (LastMethod == "DELETE") {
+            response = new HttpResponseMessage(HttpStatusCode.NoContent);
+        } else {
+            response = new HttpResponseMessage(HttpStatusCode.OK);
+            string responseBody = LastMethod == "GET" &&
+                request.RequestUri.AbsolutePath ==
+                "/products/uuid"
+                ? "\"00112233-4455-6677-8899-aabbccddeeff\""
+                : LastMethod == "GET" &&
+                    request.RequestUri.AbsolutePath == "/products"
+                    ? "[{\"Id\":41,\"Name\":\"desk lamp\"}]"
+                    : "{\"Id\":41,\"Name\":\"desk lamp\"}";
+            response.Content = new StringContent(responseBody);
+            response.Content.Headers.Remove("Content-Type");
+            response.Content.Headers.Add("Content-Type", "application/json");
+        }
+        return new Task<HttpResponseMessage>(response);
+    }
+}
+
+public void CompleteProduct(Task<Product> pending) {
+    TaskScheduler.RunUntil(pending);
+    pending.GetResult();
+}
+
+public void CompleteProductList(Task<const List<Product>> pending) {
+    TaskScheduler.RunUntil(pending);
+    pending.GetResult();
+}
+
+public void CompleteDelete(Task pending) {
+    TaskScheduler.RunUntil(pending);
+    pending.GetResult();
+}
+
+public void CompleteUuid(Task<Uuid> pending) {
+    TaskScheduler.RunUntil(pending);
+    pending.GetResult();
+}
+
+public int RunAgainstHttpServer(string baseAddress) {
+    HttpClient http = new HttpClient();
+    RestClient rest = RestClient.For<IProductsApi>(http, false);
+    rest.BaseAddress = new Uri(baseAddress);
+    IProductsApi products = rest.GetContract<IProductsApi>();
+    try {
+        Product draft = new Product();
+        draft.Name = "desk lamp";
+        Task<Product> createdTask = products.Create(draft);
+        CompleteProduct(createdTask);
+        Product created = createdTask.GetResult();
+        if (created.Id != 41 || created.Name != "desk lamp") return 1;
+
+        Task<Product> readTask = products.Get(created.Id);
+        CompleteProduct(readTask);
+        if (readTask.GetResult().Name != "desk lamp") return 2;
+
+        Task<const List<Product>> listTask = products.ListProducts();
+        CompleteProductList(listTask);
+        const List<Product> listedProducts = listTask.GetResult();
+        if (listedProducts.Count != 1u ||
+            listedProducts.Get(0u).Id != 41 ||
+            listedProducts.Get(0u).Name != "desk lamp") return 8;
+
+        Task<Uuid> uuidResultTask = products.GetUuidResult();
+        CompleteUuid(uuidResultTask);
+        if (uuidResultTask.GetResult().ToString() !=
+            "00112233-4455-6677-8899-aabbccddeeff") return 6;
+
+        Uuid productUuid = new Uuid(
+            0x00112233u, 0x44556677u, 0x8899AABBu, 0xCCDDEEFFu);
+        Task<HttpResponseMessage> uuidPathTask = products.GetByUuid(productUuid);
+        TaskScheduler.RunUntil(uuidPathTask);
+        HttpResponseMessage uuidResponse = uuidPathTask.GetResult();
+        bool uuidPathValid = uuidResponse.StatusCode == HttpStatusCode.OK;
+        uuidResponse.Dispose();
+        if (!uuidPathValid) return 7;
+
+        Product edited = new Product();
+        edited.Id = created.Id;
+        edited.Name = "reading lamp";
+        Task<Product> updateTask = products.Update(created.Id, edited);
+        CompleteProduct(updateTask);
+        Product updated = updateTask.GetResult();
+        if (updated.Id != 41 || updated.Name != "reading lamp") return 3;
+
+        Task deleteTask = products.Delete(created.Id);
+        CompleteDelete(deleteTask);
+        Console.WriteLine("generated REST CRUD wire pass");
+        return 0;
+    } finally {
+        rest.Dispose();
+        http.Dispose();
+    }
+}
+
+public int Main(string[] args) {
+    if (args.Length > 1u) {
+        Console.WriteLine("usage: RestCrudExample [local-base-address]");
+        return 2;
+    }
+    if (args.Length == 1u) return RunAgainstHttpServer(args[0u]);
+
+    LocalProductsHandler handler = new LocalProductsHandler();
+    HttpClient http = new HttpClient(handler, false);
+    RestClient rest = RestClient.For<IProductsApi>(http, false);
+    rest.BaseAddress = new Uri("https://products.example.test/");
+    IProductsApi products = rest.GetContract<IProductsApi>();
+
+    Product draft = new Product();
+    draft.Name = "desk lamp";
+    Task<Product> createdTask = products.Create(draft);
+    CompleteProduct(createdTask);
+    Product created = createdTask.GetResult();
+    if (handler.LastMethod != "POST" || handler.LastUri !=
+        "https://products.example.test/products" ||
+        handler.LastBody != "{\"Id\":0,\"Name\":\"desk lamp\"}" ||
+        created.Id != 41 || created.Name != "desk lamp") return 1;
+
+    Task<Product> readTask = products.Get(created.Id);
+    CompleteProduct(readTask);
+    if (handler.LastMethod != "GET" || handler.LastUri !=
+        "https://products.example.test/products/41" ||
+        readTask.GetResult().Name != "desk lamp") return 2;
+
+    Task<const List<Product>> listTask = products.ListProducts();
+    CompleteProductList(listTask);
+    const List<Product> listedProducts = listTask.GetResult();
+    if (handler.LastMethod != "GET" || handler.LastUri !=
+        "https://products.example.test/products" ||
+        listedProducts.Count != 1u || listedProducts.Get(0u).Id != 41 ||
+        listedProducts.Get(0u).Name != "desk lamp") return 8;
+
+    Task<Uuid> uuidResultTask = products.GetUuidResult();
+    CompleteUuid(uuidResultTask);
+    if (handler.LastMethod != "GET" || handler.LastUri !=
+        "https://products.example.test/products/uuid" ||
+        uuidResultTask.GetResult().ToString() !=
+        "00112233-4455-6677-8899-aabbccddeeff") return 6;
+
+    Uuid productUuid = new Uuid(
+        0x00112233u, 0x44556677u, 0x8899AABBu, 0xCCDDEEFFu);
+    Task<HttpResponseMessage> uuidTask = products.GetByUuid(productUuid);
+    TaskScheduler.RunUntil(uuidTask);
+    HttpResponseMessage uuidResponse = uuidTask.GetResult();
+    bool uuidRequestValid = handler.LastMethod == "GET" && handler.LastUri ==
+        "https://products.example.test/products/by-id/00112233-4455-6677-8899-aabbccddeeff" &&
+        uuidResponse.StatusCode == HttpStatusCode.OK;
+    uuidResponse.Dispose();
+    if (!uuidRequestValid) return 5;
+
+    Product edited = new Product();
+    edited.Id = created.Id;
+    edited.Name = "reading lamp";
+    Task<Product> updateTask = products.Update(created.Id, edited);
+    CompleteProduct(updateTask);
+    if (handler.LastMethod != "PUT" || handler.LastUri !=
+        "https://products.example.test/products/41" ||
+        handler.LastBody != "{\"Id\":41,\"Name\":\"reading lamp\"}" ||
+        updateTask.GetResult().Name != "desk lamp") return 3;
+
+    Task deleteTask = products.Delete(created.Id);
+    CompleteDelete(deleteTask);
+    if (handler.LastMethod != "DELETE" || handler.LastUri !=
+        "https://products.example.test/products/41") return 4;
+
+    rest.Dispose();
+    http.Dispose();
+    handler.Dispose();
+    Console.WriteLine("generated REST CRUD example pass");
+    return 0;
+}

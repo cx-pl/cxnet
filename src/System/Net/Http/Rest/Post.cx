@@ -1,0 +1,8 @@
+import System;
+
+namespace System.Net.Http.Rest;
+
+@AnnotationUsage(targets = "function")
+public final class Post : Annotation {
+    public constructor(string route) {}
+}

@@ -1,0 +1,198 @@
+import System;
+import System.Collections;
+import System.IO;
+import System.Threading.Tasks;
+import System.Interop;
+
+namespace System.Net.Sockets;
+internal struct NativeSocketAddress {
+    public int ErrorCode;
+    public int AddressFamily;
+    public uint Word0;
+    public uint Word1;
+    public uint Word2;
+    public uint Word3;
+    public uint ScopeId;
+    public uint Port;
+}
+
+internal static class SocketRuntime {
+    private static Task<uint> StartTransfer(
+        ulong handle,
+        byte[] buffer,
+        uint offset,
+        uint count,
+        CancellationToken cancellationToken,
+        bool writable) {
+        TaskCompletionSource<uint> completion = new TaskCompletionSource<uint>();
+        ptr operation = BeginTransfer(
+            handle, buffer, offset, count, cancellationToken, writable, false);
+        StartOperation(
+            operation,
+            () => completion.SetResult(GetTransferred(operation)),
+            () => completion.SetException(GetFailure(operation)),
+            () => completion.SetCanceled());
+        return completion.Task;
+    }
+
+    private static Task<uint> StartWait(
+        ulong handle,
+        CancellationToken cancellationToken,
+        bool writable) {
+        TaskCompletionSource<uint> completion = new TaskCompletionSource<uint>();
+        ptr operation = BeginWait(handle, cancellationToken, writable);
+        StartOperation(
+            operation,
+            () => completion.SetResult(1u),
+            () => completion.SetException(GetFailure(operation)),
+            () => completion.SetResult(2u));
+        return completion.Task;
+    }
+
+    private static ValueTask<uint> StartReusableTransfer(
+        ulong handle,
+        byte[] buffer,
+        uint offset,
+        uint count,
+        CancellationToken cancellationToken,
+        bool writable,
+        ReusableValueTaskSource<uint> completionSource) {
+        uint version = completionSource.GetVersion();
+        ptr operation = BeginTransfer(
+            handle, buffer, offset, count, cancellationToken, writable, true);
+        StartReusableOperation(operation, completionSource, version, () => {
+            uint completionKind = GetCompletionKind(operation);
+            if (completionKind == 1u) {
+                completionSource.SetResult(
+                    GetCompletionVersion(operation), GetTransferred(operation));
+            } else if (completionKind == 2u) {
+                completionSource.SetCanceled(GetCompletionVersion(operation));
+            } else {
+                completionSource.SetException(
+                    GetCompletionVersion(operation), GetFailure(operation));
+            }
+        });
+        ValueTask<uint> valueTask = new ValueTask<uint>();
+        valueTask.SetSource(completionSource, version);
+        return valueTask;
+    }
+
+    private static Exception GetFailure(ptr operation) {
+        uint failureKind = GetFailureKind(operation);
+        if (failureKind == 1u) return new ArgumentNullException("buffer");
+        if (failureKind == 2u) return new ArgumentOutOfRangeException("offset");
+        if (failureKind == 3u) {
+            return new InvalidOperationException(
+                "The native socket reported more bytes than requested.");
+        }
+        uint errorDomain = GetNativeErrorDomain(operation);
+        string domainName = errorDomain == 1u ? "POSIX errno" :
+            errorDomain == 2u ? "Winsock" : "socket";
+        return new SocketException("A socket operation failed.", domainName,
+            GetNativeErrorCode(operation));
+    }
+
+    private static string GetNativeErrorDomainName() {
+        uint errorDomain = GetPlatformErrorDomain();
+        return errorDomain == 1u ? "POSIX errno" :
+            errorDomain == 2u ? "Winsock" : "socket";
+    }
+
+    public static ValueTask<uint> ReadBytesTransferAsync(
+        ulong handle,
+        byte[] buffer,
+        uint offset,
+        uint count,
+        CancellationToken cancellationToken,
+        ReusableValueTaskSource<uint> completionSource) {
+        return StartReusableTransfer(
+            handle, buffer, offset, count, cancellationToken, false,
+            completionSource);
+    }
+
+    public static Task<uint> ReadAsync(
+        ulong handle,
+        byte[] buffer,
+        uint offset,
+        uint count,
+        CancellationToken cancellationToken) {
+        return StartTransfer(handle, buffer, offset, count, cancellationToken, false);
+    }
+
+    public static Task<uint> WriteAsync(
+        ulong handle,
+        byte[] buffer,
+        uint offset,
+        uint count,
+        CancellationToken cancellationToken) {
+        return StartTransfer(handle, buffer, offset, count, cancellationToken, true);
+    }
+
+    public static Task<uint> WaitAsync(
+        ulong handle, CancellationToken cancellationToken, bool writable) {
+        return StartWait(handle, cancellationToken, writable);
+    }
+
+    public static extern ulong ScheduleTimer(
+        uint milliseconds, delegate() => void continuation);
+    public static extern bool CancelTimer(ulong registrationId);
+
+    public static extern ptr BeginTransfer(
+        ulong handle,
+        byte[] buffer,
+        uint offset,
+        uint count,
+        CancellationToken cancellationToken,
+        bool writable,
+        bool singleCompletion);
+    public static extern ptr BeginWait(
+        ulong handle,
+        CancellationToken cancellationToken,
+        bool writable);
+    public static extern void StartOperation(
+        ptr operation,
+        delegate() => void completed,
+        delegate() => void faulted,
+        delegate() => void canceled);
+    public static extern void StartReusableOperation(
+        ptr operation,
+        ReusableValueTaskSource<uint> completionSource,
+        uint version,
+        delegate() => void completed);
+    public static extern uint GetCompletionKind(ptr operation);
+    public static extern uint GetCompletionVersion(ptr operation);
+    public static extern uint GetTransferred(ptr operation);
+    public static extern uint GetFailureKind(ptr operation);
+    public static extern uint GetNativeErrorDomain(ptr operation);
+    public static extern int GetNativeErrorCode(ptr operation);
+    public static extern int SetNonBlocking(ulong handle);
+    public static extern uint GetPlatformErrorDomain();
+    public static extern int Close(ulong handle);
+    public static extern ulong CreateSocket(
+        int addressFamily, int socketType, int protocolType);
+    public static extern int GetLastCreateError();
+    public static extern int ConnectStart(
+        ulong handle, int addressFamily,
+        uint word0, uint word1, uint word2, uint word3,
+        uint scopeId, uint port);
+    public static extern int ConnectBlocking(
+        ulong handle, int addressFamily,
+        uint word0, uint word1, uint word2, uint word3,
+        uint scopeId, uint port);
+    public static extern int FinishConnect(ulong handle);
+    public static extern ulong Accept(ulong listener);
+    public static extern int GetLastAcceptError();
+    public static extern ulong AcceptBlocking(ulong listener);
+    public static extern NativeSocketAddress GetSocketAddress(
+        ulong handle, bool remote);
+    public static extern int Bind(
+        ulong handle, int addressFamily,
+        uint word0, uint word1, uint word2, uint word3,
+        uint scopeId, uint port);
+    public static extern int Listen(ulong handle, int backlog);
+    public static extern int Shutdown(ulong handle, int how);
+    public static extern int SetOption(ulong handle, int option, int value);
+    public static extern int GetOption(ulong handle, int option);
+    public static extern long TransferBlocking(
+        ulong handle, byte[] buffer, uint offset, uint count, bool writable);
+}

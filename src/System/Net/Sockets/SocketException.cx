@@ -1,0 +1,114 @@
+import System;
+import System.Collections;
+import System.IO;
+import System.Threading.Tasks;
+
+namespace System.Net.Sockets;
+public class SocketException : IOException {
+    private SocketError _socketErrorCode;
+
+    public SocketError SocketErrorCode { const get { return _socketErrorCode; } }
+
+    public constructor() : this("A socket operation failed.", null, 0) { }
+
+    public constructor(const string message)
+        : this(message, null, 0) { }
+
+    public constructor(const string message, const Exception innerException)
+        : base(message ?? "A socket operation failed.", innerException) {
+        _socketErrorCode = SocketError.Unknown;
+    }
+
+    public constructor(const string message, const string nativeErrorDomain,
+        int nativeErrorCode)
+        : base(message ?? "A socket operation failed.", "socket", null,
+            nativeErrorDomain, nativeErrorCode) {
+        _socketErrorCode = MapError(nativeErrorDomain, nativeErrorCode);
+    }
+
+    private static SocketError MapError(const string domain, int code) {
+        if (domain == "dns") {
+            if (code == 11002 || code == -3) return SocketError.TryAgain;
+            if (code == 11003 || code == -4) return SocketError.NoRecovery;
+            if (code == 11004 || code == -5) return SocketError.NoData;
+            return SocketError.HostNotFound;
+        }
+        if (domain == "POSIX errno") {
+            switch (code) {
+                case 4: return SocketError.Interrupted;
+                case 11: return SocketError.WouldBlock;
+                case 13: return SocketError.AccessDenied;
+                case 22: return SocketError.InvalidArgument;
+                case 24: return SocketError.TooManyOpenSockets;
+                case 32: return SocketError.Shutdown;
+                case 88: return SocketError.NotSocket;
+                case 89: return SocketError.DestinationAddressRequired;
+                case 90: return SocketError.MessageSize;
+                case 91: return SocketError.ProtocolType;
+                case 92: return SocketError.ProtocolOption;
+                case 93: return SocketError.ProtocolNotSupported;
+                case 94: return SocketError.SocketNotSupported;
+                case 95: return SocketError.OperationNotSupported;
+                case 97: return SocketError.AddressFamilyNotSupported;
+                case 98: return SocketError.AddressAlreadyInUse;
+                case 99: return SocketError.AddressNotAvailable;
+                case 100: return SocketError.NetworkDown;
+                case 101: return SocketError.NetworkUnreachable;
+                case 102: return SocketError.NetworkReset;
+                case 103: return SocketError.ConnectionAborted;
+                case 104: return SocketError.ConnectionReset;
+                case 105: return SocketError.NoBufferSpaceAvailable;
+                case 106: return SocketError.IsConnected;
+                case 107: return SocketError.NotConnected;
+                case 108: return SocketError.Shutdown;
+                case 110: return SocketError.TimedOut;
+                case 111: return SocketError.ConnectionRefused;
+                case 112: return SocketError.HostDown;
+                case 113: return SocketError.HostUnreachable;
+                case 114: return SocketError.AlreadyInProgress;
+                case 115: return SocketError.InProgress;
+                case 125: return SocketError.OperationAborted;
+            }
+        } else if (domain == "Winsock") {
+            switch (code) {
+                case 10004: return SocketError.Interrupted;
+                case 995: return SocketError.OperationAborted;
+                case 10013: return SocketError.AccessDenied;
+                case 10022: return SocketError.InvalidArgument;
+                case 10024: return SocketError.TooManyOpenSockets;
+                case 10035: return SocketError.WouldBlock;
+                case 10036: return SocketError.InProgress;
+                case 10037: return SocketError.AlreadyInProgress;
+                case 10038: return SocketError.NotSocket;
+                case 10039: return SocketError.DestinationAddressRequired;
+                case 10040: return SocketError.MessageSize;
+                case 10041: return SocketError.ProtocolType;
+                case 10042: return SocketError.ProtocolOption;
+                case 10043: return SocketError.ProtocolNotSupported;
+                case 10044: return SocketError.SocketNotSupported;
+                case 10045: return SocketError.OperationNotSupported;
+                case 10047: return SocketError.AddressFamilyNotSupported;
+                case 10048: return SocketError.AddressAlreadyInUse;
+                case 10049: return SocketError.AddressNotAvailable;
+                case 10050: return SocketError.NetworkDown;
+                case 10051: return SocketError.NetworkUnreachable;
+                case 10052: return SocketError.NetworkReset;
+                case 10053: return SocketError.ConnectionAborted;
+                case 10054: return SocketError.ConnectionReset;
+                case 10055: return SocketError.NoBufferSpaceAvailable;
+                case 10056: return SocketError.IsConnected;
+                case 10057: return SocketError.NotConnected;
+                case 10058: return SocketError.Shutdown;
+                case 10060: return SocketError.TimedOut;
+                case 10061: return SocketError.ConnectionRefused;
+                case 10064: return SocketError.HostDown;
+                case 10065: return SocketError.HostUnreachable;
+                case 11001: return SocketError.HostNotFound;
+                case 11002: return SocketError.TryAgain;
+                case 11003: return SocketError.NoRecovery;
+                case 11004: return SocketError.NoData;
+            }
+        }
+        return SocketError.Unknown;
+    }
+}

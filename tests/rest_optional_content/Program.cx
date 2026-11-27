@@ -1,0 +1,90 @@
+import System;
+import System.Threading;
+import System.Threading.Tasks;
+import System.Net.Http;
+import System.Net.Http.Rest;
+
+namespace RestOptionalContent;
+
+@Authorize("Bearer")
+@StaticHeader("X-Optional-Content", "present")
+public interface IOptionalContentApi {
+    @Post("/optional-content")
+    Task<HttpResponseMessage> Send(@Body HttpContent? content);
+}
+
+public final class OptionalContentHandler : HttpMessageHandler {
+    public HttpContent LastContent;
+    public string LastAuthorization;
+    public string LastStaticHeader;
+
+    public override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        LastContent = request.Content;
+        LastAuthorization = request.Headers.GetFirstValue("Authorization");
+        LastStaticHeader = request.Headers.GetFirstValue("X-Optional-Content");
+        return new Task<HttpResponseMessage>(
+            new HttpResponseMessage(HttpStatusCode.OK));
+    }
+}
+
+public bool Complete(Task<HttpResponseMessage> pending) {
+    uint steps = 0u;
+    while (!pending.IsCompleted && steps < 100000u) {
+        if (!TaskScheduler.RunOne()) break;
+        steps += 1u;
+    }
+    return pending.IsCompleted;
+}
+
+public int Main(string[] args) {
+    OptionalContentHandler recordingHandler = new OptionalContentHandler();
+    HttpClient recordingHttpClient = new HttpClient(recordingHandler);
+    RestClient recordingClient = RestClient.For<IOptionalContentApi>(
+        recordingHttpClient, false);
+    recordingClient.BaseAddress = new Uri("https://example.test/");
+    recordingClient.AuthorizationProvider = scheme =>
+        scheme == "Bearer" ? "optional-token" : null;
+    IOptionalContentApi recordingApi =
+        recordingClient.GetContract<IOptionalContentApi>();
+    Task<HttpResponseMessage> recordedOmitted = recordingApi.Send(null);
+    if (!Complete(recordedOmitted) || recordingHandler.LastContent != null ||
+        recordingHandler.LastAuthorization != "Bearer optional-token" ||
+        recordingHandler.LastStaticHeader != "present") return 5;
+    HttpResponseMessage recordedResponse = recordedOmitted.GetResult();
+    recordedResponse.Dispose();
+
+    byte[] bytes = new byte[3u];
+    bytes[0u] = (byte)0u;
+    bytes[1u] = (byte)127u;
+    bytes[2u] = (byte)255u;
+    HttpContent suppliedContent = new ByteArrayContent(bytes);
+    Task<HttpResponseMessage> recordedPopulated =
+        recordingApi.Send(suppliedContent);
+    if (!Complete(recordedPopulated) ||
+        recordingHandler.LastContent != suppliedContent) return 6;
+    recordedResponse = recordedPopulated.GetResult();
+    recordedResponse.Dispose();
+    recordingClient.Dispose();
+    recordingHttpClient.Dispose();
+
+    RestClient client = RestClient.For<IOptionalContentApi>();
+    client.BaseAddress = new Uri(args[0u]);
+    client.AuthorizationProvider = scheme =>
+        scheme == "Bearer" ? "optional-token" : null;
+    IOptionalContentApi api = client.GetContract<IOptionalContentApi>();
+
+    Task<HttpResponseMessage> omitted = api.Send(null);
+    if (!Complete(omitted)) return 1;
+    HttpResponseMessage response = omitted.GetResult();
+    if (response.StatusCode != HttpStatusCode.OK) return 2;
+    response.Dispose();
+
+    Task<HttpResponseMessage> populated = api.Send(new ByteArrayContent(bytes));
+    if (!Complete(populated)) return 3;
+    response = populated.GetResult();
+    if (response.StatusCode != HttpStatusCode.OK) return 4;
+    response.Dispose();
+    client.Dispose();
+    return 0;
+}

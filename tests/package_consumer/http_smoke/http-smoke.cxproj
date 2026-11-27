@@ -1,0 +1,6 @@
+name: M26PackageHttpSmoke
+version: 0.1.0
+type: Executable
+targets: [linux-x64]
+project_references:
+- ../package-consumer.cxproj

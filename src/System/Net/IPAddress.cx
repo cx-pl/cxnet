@@ -1,0 +1,413 @@
+import System;
+
+namespace System.Net;
+
+internal struct Ipv6UriHostParts {
+    public bool Valid;
+    public string Address;
+    public string Zone;
+
+    public constructor(bool valid, string address, string zone) {
+        Valid = valid;
+        Address = address;
+        Zone = zone;
+    }
+}
+
+// Immutable IPv4 or IPv6 address. IPv6 scope identifiers are preserved.
+public final class IPAddress : Object {
+    private AddressFamily _addressFamily;
+    private uint _word0;
+    private uint _word1;
+    private uint _word2;
+    private uint _word3;
+    private uint _scopeId;
+
+    public AddressFamily AddressFamily { const get { return _addressFamily; } }
+    internal uint Word0 { const get { return _word0; } }
+    internal uint Word1 { const get { return _word1; } }
+    internal uint Word2 { const get { return _word2; } }
+    internal uint Word3 { const get { return _word3; } }
+    public uint ScopeId { const get { return _scopeId; } }
+
+    public static IPAddress Any { get { return new IPAddress(0u, 0u, 0u, 0u); } }
+    public static IPAddress Loopback { get { return new IPAddress(127u, 0u, 0u, 1u); } }
+    public static IPAddress IPv6Any { get { return new IPAddress(0u, 0u, 0u, 0u, 0u); } }
+    public static IPAddress IPv6Loopback { get { return new IPAddress(0u, 0u, 0u, 1u, 0u); } }
+
+    public static IPAddress Parse(string address) {
+        if (address == null) throw new ArgumentNullException("address");
+        return new IPAddress(address);
+    }
+
+    // URI hosts preserve IPv6 spelling, so compare parsed address bits while
+    // keeping the case-sensitive zone identifier intact.
+    internal static bool AreEquivalentIpv6UriHosts(string left, string right) {
+        Ipv6UriHostParts leftParts = GetIpv6UriHostParts(left);
+        Ipv6UriHostParts rightParts = GetIpv6UriHostParts(right);
+        if (!leftParts.Valid || !rightParts.Valid ||
+            !UriZoneIdentifiersMatch(leftParts.Zone, rightParts.Zone)) return false;
+        try {
+            return new IPAddress(leftParts.Address).Equals(
+                new IPAddress(rightParts.Address));
+        } catch (FormatException) {
+            return false;
+        }
+    }
+
+    private static Ipv6UriHostParts GetIpv6UriHostParts(string host) {
+        string address = null;
+        string zone = null;
+        if (host == null || host.Length < 4u || host.Item[0u] != '[' ||
+            host.Item[host.Length - 1u] != ']') {
+            return new Ipv6UriHostParts(false, null, null);
+        }
+        uint end = host.Length - 1u;
+        uint zoneMarker = end;
+        for (uint index = 1u; index < end; index += 1u) {
+            if (host.Item[index] == '%') {
+                zoneMarker = index;
+                break;
+            }
+        }
+        if (zoneMarker < end) {
+            if (zoneMarker + 3u >= end ||
+                host.Item[zoneMarker + 1u] != '2' ||
+                host.Item[zoneMarker + 2u] != '5') {
+                return new Ipv6UriHostParts(false, null, null);
+            }
+            zone = SliceText(host, zoneMarker + 3u, end);
+        }
+        address = SliceText(host, 1u, zoneMarker);
+        bool valid = address.Length != 0u &&
+            (zoneMarker == end || zone.Length != 0u);
+        return new Ipv6UriHostParts(valid, address, zone);
+    }
+
+    private static bool UriZoneIdentifiersMatch(string left, string right) {
+        if (left == null || right == null) return left == right;
+        uint leftIndex = 0u;
+        uint rightIndex = 0u;
+        while (leftIndex < left.Length && rightIndex < right.Length) {
+            char leftCharacter = left.Item[leftIndex];
+            char rightCharacter = right.Item[rightIndex];
+            leftIndex += 1u;
+            rightIndex += 1u;
+            if (leftCharacter == '%') {
+                if (leftIndex + 1u >= left.Length) return false;
+                uint high = UriHexValue(left.Item[leftIndex]);
+                uint low = UriHexValue(left.Item[leftIndex + 1u]);
+                if (high > 15u || low > 15u) return false;
+                leftCharacter = (char)(high * 16u + low);
+                leftIndex += 2u;
+            }
+            if (rightCharacter == '%') {
+                if (rightIndex + 1u >= right.Length) return false;
+                uint high = UriHexValue(right.Item[rightIndex]);
+                uint low = UriHexValue(right.Item[rightIndex + 1u]);
+                if (high > 15u || low > 15u) return false;
+                rightCharacter = (char)(high * 16u + low);
+                rightIndex += 2u;
+            }
+            if (leftCharacter != rightCharacter) return false;
+        }
+        return leftIndex == left.Length && rightIndex == right.Length;
+    }
+
+    private static uint UriHexValue(char value) {
+        if (value >= '0' && value <= '9') return (uint)(value - '0');
+        if (value >= 'a' && value <= 'f') return (uint)(value - 'a') + 10u;
+        if (value >= 'A' && value <= 'F') return (uint)(value - 'A') + 10u;
+        return 16u;
+    }
+
+    private static string SliceText(string value, uint start, uint end) {
+        StringBuilder result = new StringBuilder();
+        for (uint index = start; index < end; index += 1u)
+            result.Append(value.Item[index]);
+        return result.ToString();
+    }
+
+    public bool Equals(IPAddress other) const {
+        return other != null &&
+            _addressFamily == other._addressFamily &&
+            _word0 == other._word0 && _word1 == other._word1 &&
+            _word2 == other._word2 && _word3 == other._word3 &&
+            _scopeId == other._scopeId;
+    }
+
+    public override bool Equals(object other) const {
+        return other is IPAddress && Equals((IPAddress)other);
+    }
+
+    public override int GetHashCode() const {
+        return (int)(_word0 ^ _word1 ^ _word2 ^ _word3 ^ _scopeId ^
+            (_addressFamily == AddressFamily.InterNetwork ? 2u : 23u));
+    }
+
+    public override string ToString() const {
+        if (_addressFamily == AddressFamily.InterNetwork) {
+            StringBuilder ipv4 = new StringBuilder(15u);
+            ipv4.Append((_word0 / 16777216u) % 256u).Append('.');
+            ipv4.Append((_word0 / 65536u) % 256u).Append('.');
+            ipv4.Append((_word0 / 256u) % 256u).Append('.');
+            ipv4.Append(_word0 % 256u);
+            return ipv4.ToString();
+        }
+
+        ushort[] groups = new ushort[8u];
+        groups[0u] = (ushort)(_word0 / 65536u);
+        groups[1u] = (ushort)(_word0 % 65536u);
+        groups[2u] = (ushort)(_word1 / 65536u);
+        groups[3u] = (ushort)(_word1 % 65536u);
+        groups[4u] = (ushort)(_word2 / 65536u);
+        groups[5u] = (ushort)(_word2 % 65536u);
+        groups[6u] = (ushort)(_word3 / 65536u);
+        groups[7u] = (ushort)(_word3 % 65536u);
+        if (groups[0u] == 0u && groups[1u] == 0u && groups[2u] == 0u &&
+            groups[3u] == 0u && groups[4u] == 0u && groups[5u] == 65535u) {
+            StringBuilder mapped = new StringBuilder(48u);
+            mapped.Append("::ffff:");
+            mapped.Append((uint)(groups[6u] / 256u)).Append('.');
+            mapped.Append((uint)(groups[6u] % 256u)).Append('.');
+            mapped.Append((uint)(groups[7u] / 256u)).Append('.');
+            mapped.Append((uint)(groups[7u] % 256u));
+            return mapped.ToString();
+        }
+        uint bestStart = 8u;
+        uint bestLength = 1u;
+        uint index = 0u;
+        while (index < 8u) {
+            if (groups[index] == 0u) {
+                uint runStart = index;
+                while (index < 8u && groups[index] == 0u) index += 1u;
+                uint runLength = index - runStart;
+                if (runLength > bestLength) {
+                    bestStart = runStart;
+                    bestLength = runLength;
+                }
+            } else {
+                index += 1u;
+            }
+        }
+
+        StringBuilder ipv6 = new StringBuilder(48u);
+        index = 0u;
+        while (index < 8u) {
+            if (index == bestStart) {
+                ipv6.Append("::");
+                index += bestLength;
+                if (index >= 8u) break;
+            } else if (index > 0u && index != bestStart + bestLength) {
+                ipv6.Append(':');
+            }
+            AppendHex(ipv6, groups[index]);
+            index += 1u;
+        }
+        if (_scopeId != 0u) ipv6.Append('%').Append(_scopeId);
+        return ipv6.ToString();
+    }
+
+    private static void AppendHex(StringBuilder builder, uint value) {
+        uint divisor = 4096u;
+        bool started = false;
+        while (divisor > 0u) {
+            uint digit = (value / divisor) % 16u;
+            if (digit != 0u || started || divisor == 1u) {
+                builder.Append(HexDigit(digit));
+                started = true;
+            }
+            divisor = divisor / 16u;
+        }
+    }
+
+    private static char HexDigit(uint value) {
+        if (value < 10u) return (char)('0' + value);
+        return (char)('a' + value - 10u);
+    }
+
+    private static uint ParseDecimal(string text, uint start, uint end,
+        uint maximum) {
+        if (start == end) throw new FormatException("Invalid IP address.");
+        uint value = 0u;
+        while (start < end) {
+            char current = text.Item[start];
+            if (current < '0' || current > '9') {
+                throw new FormatException("Invalid IP address.");
+            }
+            uint digit = (uint)(current - '0');
+            if (value > (maximum - digit) / 10u) {
+                throw new FormatException("Invalid IP address.");
+            }
+            value = value * 10u + digit;
+            start += 1u;
+        }
+        return value;
+    }
+
+    private static uint ParseHexGroup(string text, uint start, uint end) {
+        if (start == end || end - start > 4u) {
+            throw new FormatException("Invalid IPv6 address.");
+        }
+        uint value = 0u;
+        while (start < end) {
+            char current = text.Item[start];
+            uint digit;
+            if (current >= '0' && current <= '9') digit = (uint)(current - '0');
+            else if (current >= 'a' && current <= 'f') digit = (uint)(current - 'a') + 10u;
+            else if (current >= 'A' && current <= 'F') digit = (uint)(current - 'A') + 10u;
+            else throw new FormatException("Invalid IPv6 address.");
+            value = value * 16u + digit;
+            start += 1u;
+        }
+        return value;
+    }
+
+    private void SetIPv4(string address, uint end) {
+        uint[] octets = new uint[4u];
+        uint count = 0u;
+        uint tokenStart = 0u;
+        uint index = 0u;
+        while (index <= end) {
+            if (index == end || address.Item[index] == '.') {
+                if (count >= 4u) throw new FormatException("Invalid IPv4 address.");
+                octets[count] = ParseDecimal(address, tokenStart, index, 255u);
+                count += 1u;
+                tokenStart = index + 1u;
+            }
+            index += 1u;
+        }
+        if (count != 4u) throw new FormatException("Invalid IPv4 address.");
+        _addressFamily = AddressFamily.InterNetwork;
+        _word0 = octets[0u] * 16777216u + octets[1u] * 65536u +
+            octets[2u] * 256u + octets[3u];
+        _word1 = 0u; _word2 = 0u; _word3 = 0u; _scopeId = 0u;
+    }
+
+    private void SetIPv6(string address, uint end, uint scopeStart) {
+        uint[] groups = new uint[8u];
+        uint groupCount = 0u;
+        uint compression = 8u;
+        uint cursor = 0u;
+        uint groupStart = 0u;
+        while (cursor < end) {
+            if (address.Item[cursor] == ':') {
+                if (cursor + 1u < end && address.Item[cursor + 1u] == ':') {
+                    if (compression != 8u) throw new FormatException("Invalid IPv6 address.");
+                    if (groupStart < cursor) {
+                        if (groupCount >= 8u) throw new FormatException("Invalid IPv6 address.");
+                        groups[groupCount] = ParseHexGroup(address, groupStart, cursor);
+                        groupCount += 1u;
+                    }
+                    compression = groupCount;
+                    cursor += 2u;
+                    groupStart = cursor;
+                    continue;
+                }
+                if (cursor == groupStart) throw new FormatException("Invalid IPv6 address.");
+                if (groupCount >= 8u) throw new FormatException("Invalid IPv6 address.");
+                groups[groupCount] = ParseHexGroup(address, groupStart, cursor);
+                groupCount += 1u;
+                cursor += 1u;
+                groupStart = cursor;
+                continue;
+            }
+            if (address.Item[cursor] == '.') {
+                uint[] octets = new uint[4u];
+                uint octetCount = 0u;
+                uint octetStart = groupStart;
+                uint octetCursor = groupStart;
+                while (octetCursor <= end) {
+                    if (octetCursor == end || address.Item[octetCursor] == '.') {
+                        if (octetCount >= 4u) throw new FormatException("Invalid IPv6 address.");
+                        octets[octetCount] = ParseDecimal(
+                            address, octetStart, octetCursor, 255u);
+                        octetCount += 1u;
+                        octetStart = octetCursor + 1u;
+                    }
+                    octetCursor += 1u;
+                }
+                if (octetCount != 4u || groupCount > 6u) {
+                    throw new FormatException("Invalid IPv6 address.");
+                }
+                groups[groupCount] = octets[0u] * 256u + octets[1u];
+                groups[groupCount + 1u] = octets[2u] * 256u + octets[3u];
+                groupCount += 2u;
+                cursor = end;
+                groupStart = end;
+                break;
+            }
+            cursor += 1u;
+        }
+        if (groupStart < end) {
+            if (groupCount >= 8u) throw new FormatException("Invalid IPv6 address.");
+            groups[groupCount] = ParseHexGroup(address, groupStart, end);
+            groupCount += 1u;
+        } else {
+            if (compression == 8u &&
+                (groupCount == 0u || address.Item[end - 1u] == ':')) {
+                throw new FormatException("Invalid IPv6 address.");
+            }
+        }
+        if (compression == 8u) {
+            if (groupCount != 8u) throw new FormatException("Invalid IPv6 address.");
+        } else {
+            if (groupCount >= 8u) throw new FormatException("Invalid IPv6 address.");
+            uint missing = 8u - groupCount;
+            uint move = groupCount;
+            while (move > compression) {
+                move -= 1u;
+                groups[move + missing] = groups[move];
+            }
+            move = compression;
+            while (move < compression + missing) {
+                groups[move] = 0u;
+                move += 1u;
+            }
+        }
+        _addressFamily = AddressFamily.InterNetworkV6;
+        _word0 = groups[0u] * 65536u + groups[1u];
+        _word1 = groups[2u] * 65536u + groups[3u];
+        _word2 = groups[4u] * 65536u + groups[5u];
+        _word3 = groups[6u] * 65536u + groups[7u];
+        _scopeId = scopeStart < address.Length
+            ? ParseDecimal(address, scopeStart + 1u, address.Length, 4294967295u)
+            : 0u;
+    }
+
+    internal constructor(uint word0, uint word1, uint word2, uint word3) {
+        _addressFamily = AddressFamily.InterNetwork;
+        _word0 = word0 * 16777216u + word1 * 65536u + word2 * 256u + word3;
+        _word1 = 0u; _word2 = 0u; _word3 = 0u; _scopeId = 0u;
+    }
+
+    internal constructor(uint word0, uint word1, uint word2, uint word3,
+        uint scopeId) {
+        _addressFamily = AddressFamily.InterNetworkV6;
+        _word0 = word0; _word1 = word1; _word2 = word2; _word3 = word3;
+        _scopeId = scopeId;
+    }
+
+    public constructor(string address) {
+        if (address == null) throw new ArgumentNullException("address");
+        if (address.Length == 0u) throw new FormatException("Invalid IP address.");
+        uint end = address.Length;
+        uint scopeStart = end;
+        uint index = 0u;
+        bool hasColon = false;
+        while (index < end) {
+            if (address.Item[index] == ':') hasColon = true;
+            if (address.Item[index] == '%') {
+                scopeStart = index;
+                end = index;
+                break;
+            }
+            index += 1u;
+        }
+        if (hasColon) SetIPv6(address, end, scopeStart);
+        else {
+            if (scopeStart != address.Length) throw new FormatException("Invalid IPv4 address.");
+            SetIPv4(address, end);
+        }
+    }
+}

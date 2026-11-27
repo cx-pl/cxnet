@@ -1,0 +1,32 @@
+import System.Data;
+import System.Net.Http;
+import System.Net.Http.Rest;
+import System.Threading.Tasks;
+
+namespace RestModels;
+
+public static class RestApiFactory {
+    public static RestClient Create<T>(HttpClient httpClient, bool ownsHttpClient) {
+        return RestClient.For<T>(httpClient, ownsHttpClient);
+    }
+}
+
+@Serializable
+public final class GenericEnvelope<T> {
+    public T Value;
+
+    public constructor() {}
+}
+
+public interface IReferencedBaseApi {
+    @Get("/referenced-base")
+    Task<HttpResponseMessage> GetReferencedBase();
+}
+
+public interface IReferencedGenericBaseApi<T> {
+    @Get("/referenced-generic-base")
+    Task<HttpResponseMessage> GetReferencedGenericBase(@Query("value") T value);
+
+    @Get("/referenced-generic-text")
+    Task<T> GetReferencedGenericText(@Query("value") T value);
+}

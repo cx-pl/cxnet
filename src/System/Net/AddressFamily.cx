@@ -1,0 +1,8 @@
+namespace System.Net;
+
+// Socket address families supported by cxnet's TCP implementation.
+public enum AddressFamily {
+    Unspecified = 0,
+    InterNetwork = 2,
+    InterNetworkV6 = 23
+}

@@ -1,0 +1,125 @@
+import System.Collections;
+import System.Net.Http;
+import System.Net.Http.Rest;
+import System.Threading.Tasks;
+
+public final class InvalidContract {}
+public interface EmptyContract {}
+
+public interface OpenMethodContract {
+    @Get("/open")
+    Task<T> Get<T>();
+}
+
+public interface InvalidQueryMapContract {
+    @Get("/bad-map-key")
+    Task<HttpResponseMessage> BadKey(@QueryMap Dictionary<object, string> values);
+
+    @Get("/bad-map-value")
+    Task<HttpResponseMessage> BadValue(@QueryMap Dictionary<string, object> values);
+}
+
+@StaticHeader("Bad Header", "value")
+public interface InvalidStaticHeaderNameContract {
+    @Get("/bad-static-header-name")
+    Task<HttpResponseMessage> Get();
+}
+
+@StaticHeader("X-Wire-Value", "first\r\nsecond")
+public interface InvalidStaticHeaderValueContract {
+    @Get("/bad-static-header-value")
+    Task<HttpResponseMessage> Get();
+}
+
+@StaticHeader("Content-Length", "0")
+public interface StaticContentLengthContract {
+    @Get("/static-content-length")
+    Task<HttpResponseMessage> Get();
+}
+
+@StaticHeader("Transfer-Encoding", "chunked")
+public interface StaticTransferEncodingContract {
+    @Get("/static-transfer-encoding")
+    Task<HttpResponseMessage> Get();
+}
+
+public interface InvalidHeaderBindingContract {
+    @Get("/bad-header-name")
+    Task<HttpResponseMessage> BadName(@Header("Bad Header") string value);
+
+    @Get("/managed-header")
+    Task<HttpResponseMessage> ManagedHeader(
+        @Header("Content-Length") string value);
+
+    @Get("/managed-transfer-encoding")
+    Task<HttpResponseMessage> ManagedTransferEncoding(
+        @Header("Transfer-Encoding") string value);
+}
+
+public interface MalformedRouteContract {
+    @Get("/unmatched-close}")
+    Task<HttpResponseMessage> UnmatchedClosingBrace();
+
+    @Get("/nested/{id/{child}")
+    Task<HttpResponseMessage> NestedPlaceholder();
+
+    @Get("/unclosed/{id")
+    Task<HttpResponseMessage> UnclosedPlaceholder();
+
+    @Get("/{id}/{id}")
+    Task<HttpResponseMessage> DuplicatePathBindings(
+        @Path("id") string first, @Path("id") string second);
+}
+
+public interface InvalidMultipartDispositionContract {
+    @Post("/bad-multipart-quote")
+    Task<HttpResponseMessage> BadQuote(
+        @MultipartPart("bad\"name") string value);
+
+    @Post("/bad-multipart-backslash")
+    Task<HttpResponseMessage> BadBackslash(
+        @MultipartPart("bad\\name") string value);
+
+    @Post("/bad-multipart-control")
+    Task<HttpResponseMessage> BadControl(
+        @MultipartPart("bad\rname") string value);
+
+    @Post("/bad-multipart-filename-quote")
+    Task<HttpResponseMessage> BadFilenameQuote(
+        @MultipartPart("file", "bad\"name.txt") HttpContent file);
+
+    @Post("/bad-multipart-filename-backslash")
+    Task<HttpResponseMessage> BadFilenameBackslash(
+        @MultipartPart("file", "bad\\name.txt") HttpContent file);
+
+    @Post("/bad-multipart-filename-control")
+    Task<HttpResponseMessage> BadFilenameControl(
+        @MultipartPart("file", "bad\tname.txt") HttpContent file);
+
+    @Post("/bad-multipart-collection-filename")
+    Task<HttpResponseMessage> BadCollectionFilename(
+        @MultipartPart("file", "same.txt") List<string> values);
+}
+
+public static class Program {
+    public static int Main() {
+        RestClient client = RestClient.For<InvalidContract>();
+        RestClient empty = RestClient.For<EmptyContract>();
+        RestClient openMethod = RestClient.For<OpenMethodContract>();
+        RestClient invalidMap = RestClient.For<InvalidQueryMapContract>();
+        RestClient invalidStaticName =
+            RestClient.For<InvalidStaticHeaderNameContract>();
+        RestClient invalidStaticValue =
+            RestClient.For<InvalidStaticHeaderValueContract>();
+        RestClient staticContentLength =
+            RestClient.For<StaticContentLengthContract>();
+        RestClient staticTransferEncoding =
+            RestClient.For<StaticTransferEncodingContract>();
+        RestClient invalidHeaders =
+            RestClient.For<InvalidHeaderBindingContract>();
+        RestClient malformedRoute = RestClient.For<MalformedRouteContract>();
+        RestClient invalidMultipart =
+            RestClient.For<InvalidMultipartDispositionContract>();
+        return 0;
+    }
+}

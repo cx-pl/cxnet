@@ -1,0 +1,97 @@
+import System;
+import System.Collections;
+import System.Net.Sockets;
+import System.Threading.Tasks;
+
+namespace System.Net;
+
+public static class Dns {
+    private static extern int ResolveNative(string host, byte[] output);
+
+    public static IPAddress[] GetHostAddresses(string hostNameOrAddress) {
+        if (hostNameOrAddress == null) {
+            throw new ArgumentNullException("hostNameOrAddress");
+        }
+        if (hostNameOrAddress.Length == 0u) {
+            throw new ArgumentException("Host name cannot be empty.", "hostNameOrAddress");
+        }
+
+        // 4-byte count plus at most 64 records of six 32-bit fields.
+        byte[] nativeResults = new byte[1540u];
+        int count = ResolveNative(hostNameOrAddress, nativeResults);
+        if (count < 0) {
+            throw new SocketException("Host name resolution failed.", "dns", -count);
+        }
+        count = (int)ReadUInt32(nativeResults, 0u);
+        if (count == -1) {
+            throw new SocketException("Host name resolution failed.", "dns",
+                (int)ReadUInt32(nativeResults, 4u));
+        }
+        if (count == 0) return new IPAddress[0u];
+
+        return ParseNativeResults(nativeResults, count);
+    }
+
+    public static async Task<IPAddress[]> GetHostAddressesAsync(string hostNameOrAddress) {
+        if (hostNameOrAddress == null) {
+            throw new ArgumentNullException("hostNameOrAddress");
+        }
+        if (hostNameOrAddress.Length == 0u) {
+            throw new ArgumentException("Host name cannot be empty.", "hostNameOrAddress");
+        }
+        byte[] nativeResults = new byte[1540u];
+        TaskCompletionSource<uint> completion = new TaskCompletionSource<uint>();
+        Task<uint> pending = completion.Task;
+        ValueTask<uint> pendingValue = new ValueTask<uint>();
+        pendingValue.SetTask(pending);
+        int startError = ResolveNativeAsync(
+            hostNameOrAddress, nativeResults, pending);
+        if (startError != 0) {
+            throw new SocketException("Could not start the host resolver.", "dns", startError);
+        }
+        uint ignored = await pendingValue;
+        int count = (int)ReadUInt32(nativeResults, 0u);
+        if (count == -1) {
+            throw new SocketException("Host name resolution failed.", "dns",
+                (int)ReadUInt32(nativeResults, 4u));
+        }
+        if (count == 0) return new IPAddress[0u];
+        return ParseNativeResults(nativeResults, count);
+    }
+
+    private static extern int ResolveNativeAsync(
+        string host, byte[] output, Task<uint> completion);
+
+    private static IPAddress[] ParseNativeResults(byte[] nativeResults, int count) {
+        IPAddress[] addresses = new IPAddress[(uint)count];
+        uint index = 0u;
+        while (index < (uint)count) {
+            uint offset = 4u + index * 24u;
+            uint family = ReadUInt32(nativeResults, offset);
+            uint word0 = ReadUInt32(nativeResults, offset + 4u);
+            uint word1 = ReadUInt32(nativeResults, offset + 8u);
+            uint word2 = ReadUInt32(nativeResults, offset + 12u);
+            uint word3 = ReadUInt32(nativeResults, offset + 16u);
+            uint scopeId = ReadUInt32(nativeResults, offset + 20u);
+            if (family == 2u) {
+                addresses[index] = new IPAddress(
+                    (word0 / 16777216u) % 256u,
+                    (word0 / 65536u) % 256u,
+                    (word0 / 256u) % 256u,
+                    word0 % 256u);
+            } else {
+                addresses[index] = new IPAddress(
+                    word0, word1, word2, word3, scopeId);
+            }
+            index += 1u;
+        }
+        return addresses;
+    }
+
+    private static uint ReadUInt32(byte[] buffer, uint offset) {
+        return (uint)buffer[offset] |
+            ((uint)buffer[offset + 1u] << 8u) |
+            ((uint)buffer[offset + 2u] << 16u) |
+            ((uint)buffer[offset + 3u] << 24u);
+    }
+}

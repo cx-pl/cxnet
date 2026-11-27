@@ -1,0 +1,5 @@
+source_url=https://github.com/google/brotli/archive/refs/tags/v1.2.1.tar.gz
+version=1.2.1
+sha256=98D35D11A78DC453AEBB7D10C3748F3F73FF78C8267C0DC697B8631F67BF7E8F
+license=MIT
+license_file=LICENSE

@@ -1,0 +1,635 @@
+import System;
+import System.IO;
+import System.Net.Http;
+import System.Threading;
+import System.Threading.Tasks;
+
+namespace HttpContentSetup;
+
+public static class NativeTestHooks {
+    public static extern void FailNextBufferingStarted();
+    public static extern void FailContinuationRegistrationAfter(
+        uint successfulRegistrations);
+    public static extern bool IsAvailable();
+}
+
+public final class PendingFailureStream : MemoryStream {
+    private Task<uint> _pendingRead;
+
+    public constructor() : base() { }
+
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset,
+        uint count, CancellationToken cancellationToken) {
+        _pendingRead = new Task<uint>();
+        return _pendingRead;
+    }
+
+    public void FailPendingRead() {
+        _pendingRead.SetFault(new IOException("injected pending read failure"));
+    }
+}
+
+public final class PendingDisposeStream : MemoryStream {
+    private Task<uint> _pendingRead;
+    private byte[] _pendingBuffer;
+    private uint _pendingOffset;
+    private uint _readCalls;
+    public AtomicInt Disposed;
+    public string FailureMessage;
+
+    public constructor() : base() { Disposed = new AtomicInt(0); }
+
+    public uint ReadCalls { get { return _readCalls; } }
+
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset,
+        uint count, CancellationToken cancellationToken) {
+        _readCalls += 1u;
+        _pendingBuffer = buffer;
+        _pendingOffset = offset;
+        _pendingRead = new Task<uint>();
+        return _pendingRead;
+    }
+
+    public void CompletePendingRead() { _pendingRead.SetResult(0u); }
+
+    public void CompletePendingReadWithByte(byte value) {
+        _pendingBuffer[_pendingOffset] = value;
+        _pendingRead.SetResult(1u);
+    }
+
+    public override void Dispose() {
+        Disposed.Exchange(1);
+    }
+}
+
+public final class ByteArrayReadDisposeRace {
+    public ByteArrayContent Content;
+    public byte[] Expected;
+    public AtomicInt Start;
+    public AtomicInt ReadStarted;
+    public AtomicInt Outcome;
+
+    public constructor(ByteArrayContent content, byte[] expected) {
+        Content = content;
+        Expected = expected;
+        Start = new AtomicInt(0);
+        ReadStarted = new AtomicInt(0);
+        Outcome = new AtomicInt(0);
+    }
+
+    public void Read() {
+        while (Start.Value == 0) Thread.Yield();
+        ReadStarted.Exchange(1);
+        try {
+            byte[] actual = Content.ReadAsByteArray();
+            if (actual.Length == Expected.Length &&
+                actual[0u] == Expected[0u] &&
+                actual[Expected.Length / 2u] == Expected[Expected.Length / 2u] &&
+                actual[Expected.Length - 1u] == Expected[Expected.Length - 1u]) {
+                Outcome.Exchange(1);
+            } else {
+                Outcome.Exchange(2);
+            }
+        } catch (ObjectDisposedException) {
+            Outcome.Exchange(3);
+        } catch (Exception) {
+            Outcome.Exchange(4);
+        }
+    }
+}
+
+public final class BlockingSyncReadStream : MemoryStream {
+    public AtomicInt ReadEntered;
+    public AtomicInt ReleaseRead;
+    public AtomicInt Disposed;
+
+    public constructor() : base() {
+        ReadEntered = new AtomicInt(0);
+        ReleaseRead = new AtomicInt(0);
+        Disposed = new AtomicInt(0);
+    }
+
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        ReadEntered.Exchange(1);
+        while (ReleaseRead.Value == 0) Thread.Yield();
+        if (Disposed.Value != 0)
+            throw new ObjectDisposedException("BlockingSyncReadStream");
+        return 0;
+    }
+
+    public override void Dispose() {
+        Disposed.Exchange(1);
+    }
+}
+
+public final class StreamContentSyncReadDisposeRace {
+    public StreamContent Content;
+    public AtomicInt Outcome;
+
+    public constructor(StreamContent content) {
+        Content = content;
+        Outcome = new AtomicInt(0);
+    }
+
+    public void Read() {
+        try {
+            byte[] result = Content.ReadAsByteArray();
+            Outcome.Exchange(result.Length == 0u ? 1 : 3);
+        } catch (ObjectDisposedException) {
+            Outcome.Exchange(2);
+        } catch (Exception) {
+            Outcome.Exchange(3);
+        }
+    }
+}
+
+public final class SetupFailureStream : Stream {
+    private MemoryStream _inner;
+    private string _failureMessage;
+    public AtomicInt PositionSetEntered;
+    public AtomicInt ContinuePositionSet;
+
+    public constructor() {
+        _inner = new MemoryStream();
+        _failureMessage = "injected buffering setup failure";
+        PositionSetEntered = new AtomicInt(0);
+        ContinuePositionSet = new AtomicInt(0);
+    }
+
+    public override bool CanRead { get => true; }
+    public override bool CanWrite { get => true; }
+    public override bool CanSeek { get => true; }
+    public override long Length { get => _inner.Length; }
+
+    public override long Position {
+        get => _inner.Position;
+        set {
+            if (ContinuePositionSet.Value == 0) {
+                PositionSetEntered.Exchange(1);
+                while (ContinuePositionSet.Value == 0) Thread.Yield();
+                throw new IOException(_failureMessage);
+            }
+            _inner.Position = value;
+        }
+    }
+
+    public override void Flush() { _inner.Flush(); }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        return _inner.Read(buffer, offset, count);
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        _inner.Write(buffer, offset, count);
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        return _inner.Seek(offset, origin);
+    }
+    public override void SetLength(long value) { _inner.SetLength(value); }
+    public override void Dispose() { _inner.Dispose(); }
+}
+
+public bool IsExpectedStringReadFault(Task<string> pending) {
+    uint steps = 0u;
+    while (!pending.IsCompleted && steps < 100000u) {
+        if (!TaskScheduler.RunOne()) break;
+        steps += 1u;
+    }
+    if (!pending.IsCompleted || !pending.IsFaulted || pending.IsCanceled) {
+        return false;
+    }
+    try {
+        string unexpected = pending.GetResult();
+    } catch (ObjectDisposedException) {
+        return true;
+    }
+    return false;
+}
+
+public int Main(string[] args) {
+    if (NativeTestHooks.IsAvailable()) {
+        StreamContent injectedStartFailureContent = new StreamContent(
+            new MemoryStream(new byte[0u]), 16u, false);
+        NativeTestHooks.FailNextBufferingStarted();
+        Task<byte[]> injectedStartFailure =
+            injectedStartFailureContent.ReadAsByteArrayAsync();
+        bool injectedStartFailureObserved = false;
+        if (injectedStartFailure.IsCompleted &&
+            injectedStartFailure.IsFaulted &&
+            !injectedStartFailure.IsCanceled) {
+            try {
+                byte[] unexpected = injectedStartFailure.GetResult();
+            } catch (IOException exception) {
+                injectedStartFailureObserved = exception.Message ==
+                    "Injected OnBufferingStarted failure.";
+            }
+        }
+        Task<byte[]> retryInjectedStartFailure =
+            injectedStartFailureContent.ReadAsByteArrayAsync();
+        uint injectedRetrySteps = 0u;
+        while (!retryInjectedStartFailure.IsCompleted &&
+            injectedRetrySteps < 10000u) {
+            if (!TaskScheduler.RunOne()) break;
+            injectedRetrySteps += 1u;
+        }
+        bool injectedRetrySucceeded = retryInjectedStartFailure.IsCompleted &&
+            !retryInjectedStartFailure.IsFaulted &&
+            !retryInjectedStartFailure.IsCanceled &&
+            retryInjectedStartFailure != injectedStartFailure &&
+            retryInjectedStartFailure.GetResult().Length == 0u;
+        injectedStartFailureContent.Dispose();
+        if (!injectedStartFailureObserved || !injectedRetrySucceeded) return 11;
+
+        PendingDisposeStream failedReadRegistrationStream =
+            new PendingDisposeStream();
+        StreamContent failedReadRegistrationContent = new StreamContent(
+            failedReadRegistrationStream, 16u, false);
+        NativeTestHooks.FailContinuationRegistrationAfter(0u);
+        Task<byte[]> failedReadRegistration =
+            failedReadRegistrationContent.ReadAsByteArrayAsync();
+        bool failedReadRegistrationObserved = false;
+        if (failedReadRegistration.IsCompleted &&
+            failedReadRegistration.IsFaulted &&
+            !failedReadRegistration.IsCanceled) {
+            try {
+                byte[] unexpected = failedReadRegistration.GetResult();
+            } catch (InvalidOperationException) {
+                failedReadRegistrationObserved = true;
+            }
+        }
+        Task<byte[]> cachedReadRegistration =
+            failedReadRegistrationContent.ReadAsByteArrayAsync();
+        failedReadRegistrationContent.Dispose();
+        if (!failedReadRegistrationObserved ||
+            cachedReadRegistration != failedReadRegistration ||
+            failedReadRegistrationStream.Disposed.Value == 0 ||
+            failedReadRegistrationStream.ReadCalls != 1u) return 23;
+
+        PendingDisposeStream failedWriteRegistrationStream =
+            new PendingDisposeStream();
+        StreamContent failedWriteRegistrationContent = new StreamContent(
+            failedWriteRegistrationStream, 16u, false);
+        NativeTestHooks.FailContinuationRegistrationAfter(1u);
+        Task<byte[]> failedWriteRegistration =
+            failedWriteRegistrationContent.ReadAsByteArrayAsync();
+        if (failedWriteRegistration.IsCompleted ||
+            failedWriteRegistrationStream.ReadCalls != 1u) return 24;
+        failedWriteRegistrationStream.CompletePendingReadWithByte((byte)0x4Bu);
+        uint failedWriteRegistrationSteps = 0u;
+        while (!failedWriteRegistration.IsCompleted &&
+            failedWriteRegistrationSteps < 10000u) {
+            if (!TaskScheduler.RunOne()) Thread.Yield();
+            failedWriteRegistrationSteps += 1u;
+        }
+        bool failedWriteRegistrationObserved = false;
+        if (failedWriteRegistration.IsCompleted &&
+            failedWriteRegistration.IsFaulted &&
+            !failedWriteRegistration.IsCanceled) {
+            try {
+                byte[] unexpected = failedWriteRegistration.GetResult();
+            } catch (InvalidOperationException) {
+                failedWriteRegistrationObserved = true;
+            }
+        }
+        Task<byte[]> cachedWriteRegistration =
+            failedWriteRegistrationContent.ReadAsByteArrayAsync();
+        failedWriteRegistrationContent.Dispose();
+        if (!failedWriteRegistrationObserved ||
+            cachedWriteRegistration != failedWriteRegistration ||
+            failedWriteRegistrationStream.Disposed.Value == 0 ||
+            failedWriteRegistrationStream.ReadCalls != 1u) return 25;
+    }
+
+    MemoryStream backing = new MemoryStream(new byte[4u]);
+    StreamContent content = new StreamContent(backing, 16u, false);
+    backing.Dispose();
+
+    Task<byte[]> firstRead = content.ReadAsByteArrayAsync();
+    if (!firstRead.IsCompleted || !firstRead.IsFaulted ||
+        firstRead.IsCanceled) {
+        content.Dispose();
+        return 1;
+    }
+    bool firstFailureObserved = false;
+    try {
+        byte[] unexpected = firstRead.GetResult();
+    } catch (ObjectDisposedException) {
+        firstFailureObserved = true;
+    }
+
+    Task<byte[]> secondRead = content.ReadAsByteArrayAsync();
+    bool secondFailureObserved = false;
+    if (secondRead.IsCompleted && secondRead.IsFaulted &&
+        !secondRead.IsCanceled && secondRead != firstRead) {
+        try {
+            byte[] unexpected = secondRead.GetResult();
+        } catch (ObjectDisposedException) {
+            secondFailureObserved = true;
+        }
+    }
+    if (!firstFailureObserved || !secondFailureObserved) {
+        content.Dispose();
+        return 2;
+    }
+
+    PendingFailureStream pendingFailureStream = new PendingFailureStream();
+    StreamContent pendingFailureContent = new StreamContent(
+        pendingFailureStream, 16u, false);
+    Task<byte[]> pendingFailureRead =
+        pendingFailureContent.ReadAsByteArrayAsync();
+    if (pendingFailureRead.IsCompleted) return 4;
+    pendingFailureRead.OnCompleted(() => {
+        throw new InvalidOperationException(
+            "injected byte-buffer continuation failure");
+    });
+    bool continuationFailureObserved = false;
+    pendingFailureStream.FailPendingRead();
+    uint continuationSteps = 0u;
+    while (!continuationFailureObserved && continuationSteps < 10000u) {
+        try {
+            if (!TaskScheduler.RunOne()) break;
+        } catch (InvalidOperationException) {
+            continuationFailureObserved = true;
+        }
+        continuationSteps += 1u;
+    }
+    bool pendingReadFaultObserved = false;
+    if (pendingFailureRead.IsCompleted && pendingFailureRead.IsFaulted &&
+        !pendingFailureRead.IsCanceled) {
+        try {
+            byte[] unexpected = pendingFailureRead.GetResult();
+        } catch (IOException) {
+            pendingReadFaultObserved = true;
+        }
+    }
+    Task<byte[]> cachedPendingFailure =
+        pendingFailureContent.ReadAsByteArrayAsync();
+    pendingFailureContent.Dispose();
+    if (!continuationFailureObserved || !pendingReadFaultObserved ||
+        cachedPendingFailure != pendingFailureRead) return 5;
+
+    PendingDisposeStream pendingDisposeStream = new PendingDisposeStream();
+    StreamContent pendingDisposeContent = new StreamContent(
+        pendingDisposeStream, 16u, false);
+    Task<byte[]> pendingDisposeRead =
+        pendingDisposeContent.ReadAsByteArrayAsync();
+    if (pendingDisposeRead.IsCompleted) return 7;
+    pendingDisposeContent.Dispose();
+    bool disposalCanceledRead = pendingDisposeRead.IsCompleted &&
+        pendingDisposeRead.IsCanceled && !pendingDisposeRead.IsFaulted;
+    pendingDisposeStream.CompletePendingRead();
+    uint disposeCompletionSteps = 0u;
+    while (disposeCompletionSteps < 10000u) {
+        if (!TaskScheduler.RunOne()) break;
+        disposeCompletionSteps += 1u;
+    }
+    if (!disposalCanceledRead || pendingDisposeStream.Disposed.Value == 0 ||
+        !pendingDisposeRead.IsCanceled || pendingDisposeRead.IsFaulted) return 8;
+
+    PendingDisposeStream pendingDataDisposeStream =
+        new PendingDisposeStream();
+    StreamContent pendingDataDisposeContent = new StreamContent(
+        pendingDataDisposeStream, 16u, false);
+    Task<byte[]> pendingDataDisposeRead =
+        pendingDataDisposeContent.ReadAsByteArrayAsync();
+    if (pendingDataDisposeRead.IsCompleted ||
+        pendingDataDisposeStream.ReadCalls != 1u) return 21;
+    pendingDataDisposeContent.Dispose();
+    pendingDataDisposeStream.CompletePendingReadWithByte((byte)0x6Du);
+    uint lateDataDisposeSteps = 0u;
+    while (lateDataDisposeSteps < 10000u) {
+        if (!TaskScheduler.RunOne()) break;
+        lateDataDisposeSteps += 1u;
+    }
+    if (!pendingDataDisposeRead.IsCanceled ||
+        pendingDataDisposeRead.IsFaulted ||
+        pendingDataDisposeStream.Disposed.Value == 0 ||
+        pendingDataDisposeStream.ReadCalls != 1u) return 22;
+
+    PendingDisposeStream pendingStringDisposeStream =
+        new PendingDisposeStream();
+    StreamContent pendingStringDisposeContent = new StreamContent(
+        pendingStringDisposeStream, 16u, false);
+    Task<string> pendingStringRead =
+        pendingStringDisposeContent.ReadAsStringAsync();
+    if (pendingStringRead.IsCompleted) return 12;
+    Task<string> sharedStringRead =
+        pendingStringDisposeContent.ReadAsStringAsync();
+    if (sharedStringRead != pendingStringRead) return 13;
+    pendingStringDisposeContent.Dispose();
+    uint stringDisposeSteps = 0u;
+    while (!pendingStringRead.IsCompleted && stringDisposeSteps < 10000u) {
+        if (!TaskScheduler.RunOne()) Thread.Yield();
+        stringDisposeSteps += 1u;
+    }
+    bool stringReadCanceled = pendingStringRead.IsCanceled &&
+        !pendingStringRead.IsFaulted;
+    pendingStringDisposeStream.CompletePendingRead();
+    uint lateStringDisposeSteps = 0u;
+    while (lateStringDisposeSteps < 10000u) {
+        if (!TaskScheduler.RunOne()) break;
+        lateStringDisposeSteps += 1u;
+    }
+    if (!stringReadCanceled || pendingStringDisposeStream.Disposed.Value == 0 ||
+        !pendingStringRead.IsCanceled || pendingStringRead.IsFaulted) return 14;
+
+    PendingDisposeStream racingDisposeStream = new PendingDisposeStream();
+    StreamContent racingDisposeContent = new StreamContent(
+        racingDisposeStream, 16u, false);
+    Task<byte[]> racingDisposeRead =
+        racingDisposeContent.ReadAsByteArrayAsync();
+    if (racingDisposeRead.IsCompleted) return 9;
+    AtomicInt raceStart = new AtomicInt(0);
+    AtomicInt raceException = new AtomicInt(0);
+    Thread disposingContent = Thread.Start(() => {
+        while (raceStart.Value == 0) Thread.Yield();
+        try {
+            racingDisposeContent.Dispose();
+        } catch (Exception) {
+            raceException.Exchange(2);
+        }
+    });
+    raceStart.Exchange(1);
+    try {
+        racingDisposeStream.CompletePendingRead();
+    } catch (Exception exception) {
+        raceException.Exchange(1);
+        racingDisposeStream.FailureMessage = exception.Message;
+    }
+    uint raceSteps = 0u;
+    while (!racingDisposeRead.IsCompleted && raceSteps < 100000u) {
+        try {
+            if (!TaskScheduler.RunOne()) Thread.Yield();
+        } catch (Exception) {
+            raceException.Exchange(3);
+            break;
+        }
+        raceSteps += 1u;
+    }
+    disposingContent.Join();
+    bool raceCanceled = racingDisposeRead.IsCanceled &&
+        !racingDisposeRead.IsFaulted;
+    bool raceSucceeded = false;
+    if (racingDisposeRead.IsCompleted && !racingDisposeRead.IsCanceled &&
+        !racingDisposeRead.IsFaulted) {
+        raceSucceeded = racingDisposeRead.GetResult().Length == 0u;
+    }
+    for (uint step = 0u; step < 16u; step += 1u) {
+        try {
+            if (!TaskScheduler.RunOne()) break;
+        } catch (Exception) {
+            raceException.Exchange(4);
+            break;
+        }
+    }
+    if (raceException.Value != 0 || (!raceCanceled && !raceSucceeded) ||
+        racingDisposeStream.Disposed.Value == 0 ||
+        racingDisposeRead.IsCanceled != raceCanceled ||
+        racingDisposeRead.IsFaulted) {
+        if (raceException.Value == 1)
+            System.Console.WriteLine(racingDisposeStream.FailureMessage);
+        return 10 + raceException.Value;
+    }
+
+    SetupFailureStream setupFailureStream = new SetupFailureStream();
+    StreamContent setupFailureContent = new StreamContent(
+        setupFailureStream, 16u, false);
+    Task<byte[]> observedSetupFailure = null;
+    AtomicInt setupContinuationRan = new AtomicInt(0);
+    Thread racingObserver = Thread.Start(() => {
+        while (setupFailureStream.PositionSetEntered.Value == 0) Thread.Yield();
+        observedSetupFailure = setupFailureContent.ReadAsByteArrayAsync();
+        observedSetupFailure.OnCompleted(() => {
+            setupContinuationRan.Exchange(1);
+            throw new InvalidOperationException(
+                "injected setup-failure continuation failure");
+        });
+        setupFailureStream.ContinuePositionSet.Exchange(1);
+        uint observerSteps = 0u;
+        while (setupContinuationRan.Value == 0 && observerSteps < 10000u) {
+            try {
+                if (!TaskScheduler.RunOne()) Thread.Yield();
+            } catch (InvalidOperationException) { }
+            observerSteps += 1u;
+        }
+    });
+    Task<byte[]> setupThreadRead = setupFailureContent.ReadAsByteArrayAsync();
+    racingObserver.Join();
+    uint setupContinuationSteps = 0u;
+    while (setupContinuationRan.Value == 0 && setupContinuationSteps < 10000u) {
+        try {
+            if (!TaskScheduler.RunOne()) break;
+        } catch (InvalidOperationException) { }
+        setupContinuationSteps += 1u;
+    }
+    bool setupTaskFaulted = observedSetupFailure.IsCompleted &&
+        observedSetupFailure.IsFaulted && !observedSetupFailure.IsCanceled;
+    bool setupFailureObserved = false;
+    if (setupTaskFaulted) {
+        try {
+            byte[] unexpected = observedSetupFailure.GetResult();
+        } catch (IOException) {
+            setupFailureObserved = true;
+        }
+    }
+    Task<byte[]> retrySetupFailure =
+        setupFailureContent.ReadAsByteArrayAsync();
+    uint retrySteps = 0u;
+    while (!retrySetupFailure.IsCompleted && retrySteps < 10000u) {
+        if (!TaskScheduler.RunOne()) break;
+        retrySteps += 1u;
+    }
+    bool retrySucceeded = false;
+    if (retrySetupFailure.IsCompleted && !retrySetupFailure.IsFaulted &&
+        !retrySetupFailure.IsCanceled) {
+        retrySucceeded = retrySetupFailure.GetResult().Length == 0u;
+    }
+    setupFailureContent.Dispose();
+    if (setupThreadRead != observedSetupFailure || !setupFailureObserved ||
+        setupContinuationRan.Value == 0 ||
+        retrySetupFailure == observedSetupFailure || !retrySucceeded) {
+        return 6;
+    }
+
+    byte[] raceBytes = new byte[4194304u];
+    for (uint index = 0u; index < raceBytes.Length; index += 1u) {
+        raceBytes[index] = (byte)(index * 31u + 7u);
+    }
+    for (uint round = 0u; round < 12u; round += 1u) {
+        ByteArrayContent raceContent = new ByteArrayContent(raceBytes);
+        ByteArrayReadDisposeRace race = new ByteArrayReadDisposeRace(
+            raceContent, raceBytes);
+        Thread reader = Thread.Start(() => race.Read());
+        race.Start.Exchange(1);
+        uint startSteps = 0u;
+        while (race.ReadStarted.Value == 0 && startSteps < 100000u) {
+            Thread.Yield();
+            startSteps += 1u;
+        }
+        raceContent.Dispose();
+        reader.Join();
+        if (startSteps == 100000u ||
+            (race.Outcome.Value != 1 && race.Outcome.Value != 3)) {
+            return 20;
+        }
+    }
+
+    BlockingSyncReadStream syncReadStream = new BlockingSyncReadStream();
+    StreamContent syncReadContent = new StreamContent(syncReadStream, 16u, false);
+    StreamContentSyncReadDisposeRace syncReadRace =
+        new StreamContentSyncReadDisposeRace(syncReadContent);
+    Thread syncReader = Thread.Start(() => syncReadRace.Read());
+    uint syncReadStartSteps = 0u;
+    while (syncReadStream.ReadEntered.Value == 0 && syncReadStartSteps < 100000u) {
+        Thread.Yield();
+        syncReadStartSteps += 1u;
+    }
+    if (syncReadStartSteps == 100000u) {
+        syncReadContent.Dispose();
+        syncReadStream.ReleaseRead.Exchange(1);
+        syncReader.Join();
+        return 21;
+    }
+    syncReadContent.Dispose();
+    syncReadStream.ReleaseRead.Exchange(1);
+    syncReader.Join();
+    if (syncReadRace.Outcome.Value != 2 || syncReadStream.Disposed.Value == 0)
+        return 22;
+
+    bool explicitCharsetPassed = IsExpectedStringReadFault(
+        content.ReadAsStringAsync("utf-8"));
+    bool defaultCharsetPassed = IsExpectedStringReadFault(
+        content.ReadAsStringAsync());
+    content.Dispose();
+    if (!explicitCharsetPassed || !defaultCharsetPassed) {
+        return 3;
+    }
+
+    MultipartFormDataContent multipartRetry =
+        new MultipartFormDataContent("setup-failure-boundary");
+    MemoryStream oversizedPartStream = new MemoryStream();
+    byte[] oversizedPartBytes = new byte[8u];
+    for (uint index = 0u; index < oversizedPartBytes.Length; index += 1u)
+        oversizedPartBytes[index] = (byte)(index + 1u);
+    oversizedPartStream.Write(oversizedPartBytes, 0u, oversizedPartBytes.Length);
+    oversizedPartStream.Position = 0L;
+    StreamContent oversizedPart = new StreamContent(
+        oversizedPartStream, 4u, false);
+    multipartRetry.Add(new ByteArrayContent(new byte[0u]), "first");
+    multipartRetry.Add(oversizedPart, "second");
+    bool multipartFirstFailureObserved = false;
+    try {
+        byte[] unexpectedMultipart = multipartRetry.ReadAsByteArray();
+    } catch (IOException) {
+        multipartFirstFailureObserved = true;
+    }
+    bool multipartRetryFailureObserved = false;
+    try {
+        byte[] unexpectedRetry = multipartRetry.ReadAsByteArray();
+    } catch (IOException) {
+        multipartRetryFailureObserved = true;
+    }
+    bool multipartRetryPassed = multipartFirstFailureObserved &&
+        multipartRetryFailureObserved;
+    multipartRetry.Dispose();
+    if (!multipartRetryPassed) return 23;
+    return 0;
+}

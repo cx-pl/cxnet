@@ -1,0 +1,171 @@
+import System.Collections;
+import System.Collections;
+import System.IO;
+import System.Threading;
+
+namespace System.Net.Http;
+
+internal struct MultipartPart {
+    public string Name;
+    public string FileName;
+    public HttpContent Content;
+}
+
+public final class MultipartFormDataContent : HttpContent {
+    private string _boundary;
+    private List<MultipartPart> _parts;
+    private byte[] _buffered;
+    private Mutex _partsMutex;
+    private ulong _partsVersion;
+    private bool _partsDisposed;
+
+    public constructor(string boundary = "cxnet-boundary") {
+        if (boundary == null || boundary.Length == 0u) throw new System.ArgumentException("Multipart boundary cannot be empty.", "boundary");
+        for (uint index = 0u; index < boundary.Length; index += 1u) {
+            char value = boundary.Item[index];
+            if (value <= ' ' || value >= (char)0x7F || value == '"' || value == '\\') {
+                throw new System.ArgumentException("Multipart boundary contains an invalid character.", "boundary");
+            }
+        }
+        _boundary = boundary;
+        _parts = new List<MultipartPart>();
+        _partsMutex = new Mutex();
+        _partsVersion = 0u;
+        _partsDisposed = false;
+        Headers.Add("Content-Type", "multipart/form-data; boundary=" + boundary);
+    }
+
+    public void Add(HttpContent content, string name) { Add(content, name, ""); }
+
+    public void Add(HttpContent content, string name, string fileName) {
+        if (content == null) throw new System.ArgumentNullException("content");
+        ValidateDispositionParameter(name, "name");
+        if (fileName == null) fileName = "";
+        if (fileName.Length > 0u) ValidateDispositionParameter(fileName, "fileName");
+        MultipartPart part;
+        part.Name = name;
+        part.FileName = fileName;
+        part.Content = content;
+        _partsMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (_partsDisposed) throw new System.ObjectDisposedException(
+                "MultipartFormDataContent");
+            _parts.Add(part);
+            _partsVersion += 1u;
+            _buffered = null;
+        } finally {
+            _partsMutex.Unlock();
+        }
+    }
+
+    private static void ValidateDispositionParameter(string value, string parameterName) {
+        if (value == null || value.Length == 0u) throw new System.ArgumentException("Multipart form field names cannot be empty.", parameterName);
+        for (uint index = 0u; index < value.Length; index += 1u) {
+            char current = value.Item[index];
+            if (current < ' ' || current == (char)0x7Fu ||
+                current == '"' || current == '\\') {
+                throw new System.ArgumentException(
+                    "Multipart disposition parameters cannot contain control characters, quotes, or backslashes.",
+                    parameterName);
+            }
+        }
+    }
+
+    public override byte[] ReadAsByteArray() {
+        List<MultipartPart> parts = new List<MultipartPart>();
+        ulong partsVersion = 0u;
+        _partsMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (_buffered != null) return Copy(_buffered);
+            partsVersion = _partsVersion;
+            for (uint index = 0u; index < _parts.Count; index += 1u)
+                parts.Add(_parts.Get(index));
+        } finally {
+            _partsMutex.Unlock();
+        }
+        MemoryStream stream = new MemoryStream();
+        try {
+            for (uint index = 0u; index < parts.Count; index += 1u) {
+                MultipartPart part = parts.Get(index);
+                WriteText(stream, "--" + _boundary + "\r\nContent-Disposition: form-data; name=\"" + part.Name + "\"");
+                if (part.FileName.Length > 0u) WriteText(stream, "; filename=\"" + part.FileName + "\"");
+                WriteText(stream, "\r\n");
+                string contentType = part.Content.Headers.GetFirstValue("Content-Type");
+                if (contentType != null) WriteText(stream, "Content-Type: " + contentType + "\r\n");
+                WriteText(stream, "\r\n");
+                byte[] bytes = part.Content.ReadAsByteArray();
+                if (stream.Length > 67108864L ||
+                    (long)bytes.Length > 67108864L - stream.Length) {
+                    throw new System.IO.IOException("Multipart content exceeded its 64 MiB buffer limit.");
+                }
+                stream.Write(bytes, 0u, bytes.Length);
+                WriteText(stream, "\r\n");
+            }
+            WriteText(stream, "--" + _boundary + "--\r\n");
+            byte[] contentBytes = stream.ToArray();
+            _partsMutex.Lock();
+            try {
+                if (!_partsDisposed && partsVersion == _partsVersion)
+                    _buffered = contentBytes;
+            } finally {
+                _partsMutex.Unlock();
+            }
+            return Copy(contentBytes);
+        } finally {
+            stream.Dispose();
+        }
+    }
+
+    private static void WriteText(Stream stream, string text) {
+        byte[] bytes = HttpUtf8.Encode(text);
+        if (stream.Length > 67108864L ||
+            (long)bytes.Length > 67108864L - stream.Length) {
+            throw new System.IO.IOException("Multipart content exceeded its 64 MiB buffer limit.");
+        }
+        stream.Write(bytes, 0u, bytes.Length);
+    }
+
+    private static byte[] Copy(byte[] value) {
+        byte[] copy = new byte[value.Length];
+        for (uint index = 0u; index < value.Length; index += 1u) copy[index] = value[index];
+        return copy;
+    }
+
+    public override void Dispose() {
+        System.Exception firstException = null;
+        List<MultipartPart> partsToDispose = null;
+        try {
+            MarkDisposed();
+        } catch (System.Exception exception) {
+            firstException = exception;
+        }
+        _partsMutex.Lock();
+        try {
+            if (!_partsDisposed) {
+                _partsDisposed = true;
+                _partsVersion += 1u;
+                partsToDispose = _parts;
+                _parts = null;
+                _buffered = null;
+            }
+        } finally {
+            _partsMutex.Unlock();
+        }
+        if (partsToDispose != null) {
+            try {
+                for (uint index = 0u; index < partsToDispose.Count; index += 1u) {
+                    try {
+                        partsToDispose.Get(index).Content.Dispose();
+                    } catch (System.Exception exception) {
+                        if (firstException == null) firstException = exception;
+                    }
+                }
+            } finally {
+                partsToDispose.Clear();
+            }
+        }
+        if (firstException != null) throw firstException;
+    }
+}

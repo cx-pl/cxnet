@@ -1,0 +1,330 @@
+import System;
+
+namespace System.Net.Http;
+
+// Text encodings supported by the initial HTTP content surface.
+internal static class HttpTextEncoding {
+    public static string GetCharset(HttpHeaders headers) {
+        if (headers == null) return "utf-8";
+        return GetCharsetFromContentType(headers.GetFirstValue("Content-Type"));
+    }
+
+    public static string GetCharsetFromContentType(string contentType) {
+        if (contentType == null) return "utf-8";
+        uint index = 0u;
+        bool charsetFound = false;
+        string charset = "utf-8";
+        while (index < contentType.Length) {
+            while (index < contentType.Length && contentType.Item[index] != ';') {
+                index += 1u;
+            }
+            if (index == contentType.Length) break;
+            index += 1u;
+            index = SkipWhitespace(contentType, index);
+            uint nameStart = index;
+            while (index < contentType.Length && contentType.Item[index] != '=' &&
+                contentType.Item[index] != ';') index += 1u;
+            uint nameEnd = TrimEnd(contentType, nameStart, index);
+            bool charsetParameter =
+                EqualsRange(contentType, nameStart, nameEnd, "charset");
+            if (index == contentType.Length || contentType.Item[index] != '=') {
+                if (charsetParameter) {
+                    throw new FormatException(
+                        "The Content-Type charset parameter has no value.");
+                }
+                continue;
+            }
+            index += 1u;
+            index = SkipWhitespace(contentType, index);
+            string parameterValue;
+            bool quotedValue = false;
+            if (index < contentType.Length && contentType.Item[index] == '"') {
+                quotedValue = true;
+                index += 1u;
+                StringBuilder quotedValueBuilder = new StringBuilder();
+                while (index < contentType.Length && contentType.Item[index] != '"') {
+                    char quotedCharacter = contentType.Item[index];
+                    if (quotedCharacter == '\\' &&
+                        index + 1u < contentType.Length) {
+                        char escapedCharacter = contentType.Item[index + 1u];
+                        if (charsetParameter &&
+                            ((escapedCharacter < ' ' && escapedCharacter != '\t') ||
+                                escapedCharacter == (char)0x7Fu)) {
+                            throw new FormatException(
+                                "The Content-Type charset parameter is malformed.");
+                        }
+                        quotedValueBuilder.Append(escapedCharacter);
+                        index += 2u;
+                        continue;
+                    }
+                    if (quotedCharacter == '\\') {
+                        index = contentType.Length;
+                        break;
+                    }
+                    if (charsetParameter &&
+                        ((quotedCharacter < ' ' && quotedCharacter != '\t') ||
+                            quotedCharacter == (char)0x7Fu)) {
+                        throw new FormatException(
+                            "The Content-Type charset parameter is malformed.");
+                    }
+                    quotedValueBuilder.Append(quotedCharacter);
+                    index += 1u;
+                }
+                if (index == contentType.Length) {
+                    if (charsetParameter) {
+                        throw new FormatException("The Content-Type charset parameter is unterminated.");
+                    }
+                    return "utf-8";
+                }
+                parameterValue = quotedValueBuilder.ToString();
+                index += 1u;
+                while (index < contentType.Length && contentType.Item[index] != ';') {
+                    if (!IsWhitespace(contentType.Item[index])) {
+                        if (charsetParameter) {
+                            throw new FormatException("The Content-Type charset parameter is malformed.");
+                        }
+                        while (index < contentType.Length && contentType.Item[index] != ';') index += 1u;
+                        break;
+                    }
+                    index += 1u;
+                }
+            } else {
+                uint valueStart = index;
+                while (index < contentType.Length && contentType.Item[index] != ';') {
+                    index += 1u;
+                }
+                uint valueEnd = TrimEnd(contentType, valueStart, index);
+                parameterValue = Slice(contentType, valueStart, valueEnd - valueStart);
+            }
+            if (charsetParameter) {
+                if (charsetFound) {
+                    throw new FormatException(
+                        "The Content-Type contains multiple charset parameters.");
+                }
+                uint valueStart = SkipWhitespace(parameterValue, 0u);
+                uint valueEnd = TrimEnd(parameterValue, valueStart,
+                    parameterValue.Length);
+                if (valueStart == valueEnd) {
+                    throw new FormatException(
+                        "The Content-Type charset parameter has no value.");
+                }
+                if (!quotedValue && !IsToken(parameterValue)) {
+                    throw new FormatException(
+                        "The Content-Type charset parameter is malformed.");
+                }
+                charset = NormalizeCharset(parameterValue);
+                charsetFound = true;
+            }
+        }
+        return charset;
+    }
+
+    public static bool HasCharset(string contentType) {
+        if (contentType == null) return false;
+        uint index = 0u;
+        while (index < contentType.Length) {
+            while (index < contentType.Length && contentType.Item[index] != ';') {
+                index += 1u;
+            }
+            if (index == contentType.Length) break;
+            index += 1u;
+            index = SkipWhitespace(contentType, index);
+            uint nameStart = index;
+            while (index < contentType.Length && contentType.Item[index] != '=' &&
+                contentType.Item[index] != ';') index += 1u;
+            uint nameEnd = TrimEnd(contentType, nameStart, index);
+            if (EqualsRange(contentType, nameStart, nameEnd, "charset")) {
+                if (index == contentType.Length || contentType.Item[index] != '=') {
+                    throw new FormatException(
+                        "The Content-Type charset parameter has no value.");
+                }
+                return true;
+            }
+            while (index < contentType.Length && contentType.Item[index] != ';') {
+                index += 1u;
+            }
+        }
+        return false;
+    }
+
+    public static string AddCharset(string mediaType, string charset) {
+        string normalized = NormalizeCharset(charset);
+        if (HasCharset(mediaType)) {
+            if (GetCharsetFromContentType(mediaType) != normalized) {
+                throw new ArgumentException(
+                    "The Content-Type charset does not match the selected encoding.",
+                    "mediaType");
+            }
+            return mediaType;
+        }
+        return mediaType + "; charset=" + normalized;
+    }
+
+    public static byte[] Encode(string value, string charset) {
+        if (value == null) throw new ArgumentNullException("value");
+        string normalized = NormalizeCharset(charset);
+        if (normalized == "utf-8") return HttpUtf8.Encode(value);
+        bool ascii = normalized == "us-ascii";
+        byte[] bytes = new byte[value.Length];
+        for (uint index = 0u; index < value.Length; index += 1u) {
+            uint scalar = (uint)value.Item[index];
+            uint limit = ascii ? 0x7Fu : 0xFFu;
+            if (scalar > limit) {
+                throw new EncodingException(
+                    "The string contains a scalar that cannot be represented by " +
+                    normalized + ".", index);
+            }
+            bytes[index] = (byte)scalar;
+        }
+        return bytes;
+    }
+
+    public static string Decode(byte[] bytes, string charset) {
+        if (bytes == null) throw new ArgumentNullException("bytes");
+        string normalized = NormalizeCharset(charset);
+        if (normalized == "utf-8") return HttpUtf8.Decode(bytes);
+        bool ascii = normalized == "us-ascii";
+        StringBuilder result = new StringBuilder(bytes.Length);
+        for (uint index = 0u; index < bytes.Length; index += 1u) {
+            uint value = (uint)bytes[index];
+            if (ascii && value > 0x7Fu) {
+                throw new EncodingException("Invalid US-ASCII content.", index);
+            }
+            result.Append((char)value);
+        }
+        return result.ToString();
+    }
+
+    public static string DecodePrefix(byte[] bytes, uint maxBytes,
+        string charset) {
+        if (bytes == null) throw new ArgumentNullException("bytes");
+        string normalizedCharset = NormalizeCharset(charset);
+        uint count = bytes.Length < maxBytes ? bytes.Length : maxBytes;
+        bool truncated = bytes.Length > maxBytes;
+        byte[] prefix = new byte[count];
+        for (uint index = 0u; index < count; index += 1u) {
+            prefix[index] = bytes[index];
+        }
+        if (truncated && normalizedCharset == "utf-8") {
+            prefix = TrimIncompleteUtf8Tail(prefix);
+        }
+        return Decode(prefix, normalizedCharset);
+    }
+
+    public static byte[] TrimIncompleteUtf8Tail(byte[] bytes) {
+        if (bytes == null) throw new ArgumentNullException("bytes");
+        uint length = bytes.Length;
+        if (length == 0u) return bytes;
+        uint sequenceStart = length;
+        uint continuationCount = 0u;
+        while (sequenceStart > 0u &&
+            (((uint)bytes[sequenceStart - 1u] & 0xC0u) == 0x80u)) {
+            sequenceStart -= 1u;
+            continuationCount += 1u;
+        }
+        uint leadIndex;
+        if (sequenceStart == length) {
+            leadIndex = length - 1u;
+        } else {
+            if (sequenceStart == 0u) return bytes;
+            leadIndex = sequenceStart - 1u;
+        }
+        uint lead = (uint)bytes[leadIndex];
+        uint requiredContinuations;
+        if (lead >= 0xC2u && lead <= 0xDFu) requiredContinuations = 1u;
+        else if (lead >= 0xE0u && lead <= 0xEFu) requiredContinuations = 2u;
+        else if (lead >= 0xF0u && lead <= 0xF4u) requiredContinuations = 3u;
+        else return bytes;
+        if (continuationCount >= requiredContinuations) return bytes;
+        if (continuationCount != 0u) {
+            uint firstContinuation = (uint)bytes[leadIndex + 1u];
+            if ((lead == 0xE0u && firstContinuation < 0xA0u) ||
+                (lead == 0xEDu && firstContinuation > 0x9Fu) ||
+                (lead == 0xF0u && firstContinuation < 0x90u) ||
+                (lead == 0xF4u && firstContinuation > 0x8Fu)) {
+                return bytes;
+            }
+        }
+        byte[] completePrefix = new byte[leadIndex];
+        for (uint index = 0u; index < leadIndex; index += 1u) {
+            completePrefix[index] = bytes[index];
+        }
+        return completePrefix;
+    }
+
+    public static string NormalizeCharset(string charset) {
+        if (charset == null) throw new ArgumentNullException("charset");
+        uint start = 0u;
+        uint end = charset.Length;
+        while (start < end && IsWhitespace(charset.Item[start])) start += 1u;
+        while (end > start && IsWhitespace(charset.Item[end - 1u])) end -= 1u;
+        if (end - start >= 2u && charset.Item[start] == '"' &&
+            charset.Item[end - 1u] == '"') {
+            start += 1u;
+            end -= 1u;
+        }
+        if (EqualsRange(charset, start, end, "utf-8") ||
+            EqualsRange(charset, start, end, "utf8")) return "utf-8";
+        if (EqualsRange(charset, start, end, "us-ascii") ||
+            EqualsRange(charset, start, end, "ascii")) return "us-ascii";
+        if (EqualsRange(charset, start, end, "iso-8859-1") ||
+            EqualsRange(charset, start, end, "iso8859-1") ||
+            EqualsRange(charset, start, end, "latin1") ||
+            EqualsRange(charset, start, end, "latin-1")) return "iso-8859-1";
+        throw new NotSupportedException(
+            "The HTTP text encoding '" + Slice(charset, start, end - start) +
+            "' is not supported.");
+    }
+
+    private static uint SkipWhitespace(string value, uint index) {
+        while (index < value.Length && IsWhitespace(value.Item[index])) index += 1u;
+        return index;
+    }
+
+    private static bool IsToken(string value) {
+        if (value.Length == 0u) return false;
+        for (uint index = 0u; index < value.Length; index += 1u) {
+            if (!IsTokenCharacter(value.Item[index])) return false;
+        }
+        return true;
+    }
+
+    private static bool IsTokenCharacter(char value) {
+        if ((value >= '0' && value <= '9') ||
+            (value >= 'A' && value <= 'Z') ||
+            (value >= 'a' && value <= 'z')) return true;
+        return value == '!' || value == '#' || value == '$' || value == '%' ||
+            value == '&' || value == '\'' || value == '*' || value == '+' ||
+            value == '-' || value == '.' || value == '^' || value == '_' ||
+            value == '`' || value == '|' || value == '~';
+    }
+
+    private static uint TrimEnd(string value, uint start, uint end) {
+        while (end > start && IsWhitespace(value.Item[end - 1u])) end -= 1u;
+        return end;
+    }
+
+    private static bool IsWhitespace(char value) {
+        return value == ' ' || value == '\t';
+    }
+
+    private static bool EqualsRange(string value, uint start, uint end,
+        string expected) {
+        if (end - start != expected.Length) return false;
+        for (uint index = 0u; index < expected.Length; index += 1u) {
+            char actual = value.Item[start + index];
+            char wanted = expected.Item[index];
+            if (actual >= 'A' && actual <= 'Z') actual = (char)((uint)actual + 32u);
+            if (actual != wanted) return false;
+        }
+        return true;
+    }
+
+    private static string Slice(string value, uint start, uint count) {
+        StringBuilder result = new StringBuilder(count);
+        for (uint index = 0u; index < count; index += 1u) {
+            result.Append(value.Item[start + index]);
+        }
+        return result.ToString();
+    }
+}

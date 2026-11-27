@@ -1,0 +1,40 @@
+import System;
+
+namespace System.Net;
+
+public final class DnsEndPoint : EndPoint {
+    private string _host;
+    private int _port;
+
+    public string Host { const get { return _host; } }
+    public int Port { const get { return _port; } }
+
+    public AddressFamily AddressFamily {
+        const get { return AddressFamily.Unspecified; }
+    }
+
+    public constructor(string host, int port) {
+        if (host == null) throw new ArgumentNullException("host");
+        if (host.Length == 0u) throw new ArgumentException("Host cannot be empty.", "host");
+        if (port < 0 || port > 65535) throw new ArgumentOutOfRangeException("port");
+        _host = host;
+        _port = port;
+    }
+
+    public override string ToString() const {
+        StringBuilder builder = new StringBuilder(64u);
+        return builder.Append(_host).Append(':').Append(_port).ToString();
+    }
+
+    public bool Equals(DnsEndPoint other) const {
+        return other != null && _host == other._host && _port == other._port;
+    }
+
+    public override bool Equals(object other) const {
+        return other is DnsEndPoint && Equals((DnsEndPoint)other);
+    }
+
+    public override int GetHashCode() const {
+        return _host.GetHashCode() ^ _port;
+    }
+}

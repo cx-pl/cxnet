@@ -1,0 +1,4 @@
+name: streamingRead
+type: Library
+project_references:
+- ../../src/cxnet.cxproj

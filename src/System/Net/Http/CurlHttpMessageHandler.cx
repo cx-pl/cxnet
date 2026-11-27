@@ -1,0 +1,779 @@
+import System;
+import System.IO;
+import System.Threading;
+import System.Threading.Tasks;
+
+namespace System.Net.Http;
+
+// Native transport backed by libcurl's multi socket interface when the
+// platform package carries pinned curl and zlib binaries per supported RID.
+public final class CurlHttpMessageHandler : HttpMessageHandler {
+    private uint _maxResponseContentBufferSize;
+    private bool _automaticDecompression;
+    private string _caCertificateFile;
+    private string _proxyCaCertificateFile;
+    private bool _allowUnknownCertificateRevocation;
+    private Mutex _shareMutex;
+    private ptr _connectionShare;
+    private bool _disposeStarted;
+
+    public uint MaxResponseContentBufferSize {
+        get {
+            EnsureHandlerOpen();
+            _shareMutex.Lock();
+            try {
+                EnsureHandlerOpen();
+                return _maxResponseContentBufferSize;
+            } finally {
+                _shareMutex.Unlock();
+            }
+        }
+        set {
+            if (value == 0u || value > 67108864u) {
+                throw new ArgumentOutOfRangeException("value");
+            }
+            EnsureHandlerOpen();
+            _shareMutex.Lock();
+            try {
+                EnsureHandlerOpen();
+                _maxResponseContentBufferSize = value;
+            } finally {
+                _shareMutex.Unlock();
+            }
+        }
+    }
+
+    public bool AutomaticDecompression {
+        get {
+            EnsureHandlerOpen();
+            _shareMutex.Lock();
+            try {
+                EnsureHandlerOpen();
+                return _automaticDecompression;
+            } finally {
+                _shareMutex.Unlock();
+            }
+        }
+        set {
+            EnsureHandlerOpen();
+            _shareMutex.Lock();
+            try {
+                EnsureHandlerOpen();
+                _automaticDecompression = value;
+            } finally {
+                _shareMutex.Unlock();
+            }
+        }
+    }
+
+    // Empty uses the platform's default trust store. A file path adds a CA
+    // bundle while peer and hostname verification remain enabled.
+    public string CaCertificateFile {
+        get {
+            EnsureHandlerOpen();
+            _shareMutex.Lock();
+            try {
+                EnsureHandlerOpen();
+                return _caCertificateFile;
+            } finally {
+                _shareMutex.Unlock();
+            }
+        }
+        set {
+            EnsureHandlerOpen();
+            if (value == null) throw new ArgumentNullException("value");
+            _shareMutex.Lock();
+            try {
+                EnsureHandlerOpen();
+                ptr replacement = CurlHttpTransport.CreateConnectionShare();
+                ptr previous = _connectionShare;
+                _connectionShare = replacement;
+                _caCertificateFile = value;
+                if (previous != null) CurlHttpTransport.ReleaseConnectionShare(previous);
+            } finally {
+                _shareMutex.Unlock();
+            }
+        }
+    }
+
+    // Empty uses the platform's default trust store for TLS to an HTTPS proxy.
+    // A file path adds a CA bundle while proxy peer and hostname verification
+    // remain enabled.
+    public string ProxyCaCertificateFile {
+        get {
+            EnsureHandlerOpen();
+            _shareMutex.Lock();
+            try {
+                EnsureHandlerOpen();
+                return _proxyCaCertificateFile;
+            } finally {
+                _shareMutex.Unlock();
+            }
+        }
+        set {
+            EnsureHandlerOpen();
+            if (value == null) throw new ArgumentNullException("value");
+            _shareMutex.Lock();
+            try {
+                EnsureHandlerOpen();
+                ptr replacement = CurlHttpTransport.CreateConnectionShare();
+                ptr previous = _connectionShare;
+                _connectionShare = replacement;
+                _proxyCaCertificateFile = value;
+                if (previous != null) CurlHttpTransport.ReleaseConnectionShare(previous);
+            } finally {
+                _shareMutex.Unlock();
+            }
+        }
+    }
+
+    // Schannel can accept an otherwise valid destination or proxy chain when
+    // revocation status is unavailable. Revoked certificates still fail.
+    public bool AllowUnknownCertificateRevocation {
+        get {
+            EnsureHandlerOpen();
+            _shareMutex.Lock();
+            try {
+                EnsureHandlerOpen();
+                return _allowUnknownCertificateRevocation;
+            } finally {
+                _shareMutex.Unlock();
+            }
+        }
+        set {
+            EnsureHandlerOpen();
+            _shareMutex.Lock();
+            try {
+                EnsureHandlerOpen();
+                ptr replacement = CurlHttpTransport.CreateConnectionShare();
+                ptr previous = _connectionShare;
+                _connectionShare = replacement;
+                _allowUnknownCertificateRevocation = value;
+                if (previous != null) CurlHttpTransport.ReleaseConnectionShare(previous);
+            } finally {
+                _shareMutex.Unlock();
+            }
+        }
+    }
+
+    public constructor() {
+        _maxResponseContentBufferSize = 67108864u;
+        _automaticDecompression = true;
+        _caCertificateFile = "";
+        _proxyCaCertificateFile = "";
+        _allowUnknownCertificateRevocation = false;
+        _shareMutex = new Mutex();
+        _connectionShare = CurlHttpTransport.CreateConnectionShare();
+        _disposeStarted = false;
+    }
+
+    public override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        EnsureHandlerOpen();
+        if (request == null) throw new ArgumentNullException("request");
+        request.EnsureOpen();
+        if (cancellationToken.IsCancellationRequested) {
+            Task<HttpResponseMessage> canceled =
+                new Task<HttpResponseMessage>();
+            canceled.SetCanceled();
+            return canceled;
+        }
+        Task<HttpResponseMessage> task = new Task<HttpResponseMessage>();
+        CurlHttpRequestState state = new CurlHttpRequestState(task);
+        uint maxResponseContentBufferSize = 0u;
+        Stream uploadSource = null;
+        CurlUploadStream upload = null;
+        try {
+            uploadSource = request.Content == null
+                ? null : request.Content.GetTransportReadStream();
+            upload = uploadSource == null
+                ? null : new CurlUploadStream(uploadSource, state, cancellationToken);
+        } catch (Exception exception) {
+            if (uploadSource != null) {
+                try { request.Content.OnTransportSetupFailed(uploadSource); }
+                catch (Exception) { }
+            }
+            throw exception;
+        }
+        bool uploadReadStarted = false;
+        CurlResponseStream responseStream = null;
+        _shareMutex.Lock();
+        try {
+            EnsureHandlerOpen();
+            maxResponseContentBufferSize =
+                request.TransportMaxResponseContentBufferSize == 0u
+                    ? _maxResponseContentBufferSize
+                    : request.TransportMaxResponseContentBufferSize;
+            if (request.TransportResponseHeadersRead) {
+                responseStream = new CurlResponseStream(state, cancellationToken,
+                    maxResponseContentBufferSize);
+            }
+            if (_connectionShare == null) {
+                _connectionShare = CurlHttpTransport.CreateConnectionShare();
+            }
+            if (CurlHttpTransport.ShouldInjectBeginSendSetupFailure()) {
+                throw new InvalidOperationException(
+                    "Injected curl transport setup failure.");
+            }
+            CurlHttpTransport.BeginSend(request, cancellationToken, task, state,
+                maxResponseContentBufferSize, _automaticDecompression,
+                _caCertificateFile, _allowUnknownCertificateRevocation,
+                _proxyCaCertificateFile,
+                request.TransportProxy, request.TransportProxyBypassList,
+                request.TransportProxyUsername, request.TransportProxyPassword,
+                request.TransportResponseHeadersRead, responseStream, upload,
+                request.TransportMaxConnectionsPerServer,
+                request.TransportPooledConnectionIdleTimeoutMilliseconds,
+                request.TransportPooledConnectionLifetimeMilliseconds,
+                _connectionShare);
+            if (uploadSource != null) {
+                if (state.NativeOperation != null)
+                    request.Content.OnTransportReadStarted(uploadSource);
+                else
+                    request.Content.OnTransportSetupFailed(uploadSource);
+                uploadReadStarted = true;
+            }
+        } catch (Exception exception) {
+            if (uploadSource != null && !uploadReadStarted) {
+                try { request.Content.OnTransportSetupFailed(uploadSource); }
+                catch (Exception) { }
+            }
+            if (upload != null) {
+                try { upload.CancelTransport(); }
+                catch (Exception) { }
+            }
+            if (state.NativeOperation != null) {
+                try { CurlHttpTransport.CancelSend(state); }
+                catch (Exception) { }
+            }
+            if (responseStream != null) {
+                try { responseStream.Dispose(); }
+                catch (Exception) { }
+            }
+            throw exception;
+        } finally {
+            _shareMutex.Unlock();
+        }
+        try {
+            if (upload != null) {
+                if (state.NativeOperation != null) upload.BeginPump();
+                else upload.CancelTransport();
+            }
+        } catch (Exception exception) {
+            if (upload != null) {
+                try { upload.CancelTransport(); }
+                catch (Exception) { }
+            }
+            if (responseStream != null) {
+                try { responseStream.Dispose(); }
+                catch (Exception) { }
+            }
+            if (state.NativeOperation != null) {
+                try { CurlHttpTransport.CancelSend(state); }
+                catch (Exception) { }
+            }
+            throw exception;
+        }
+        try {
+            state.RegisterCancellation(cancellationToken);
+        } catch (Exception exception) {
+            if (upload != null) {
+                try { upload.CancelTransport(); }
+                catch (Exception) { }
+            }
+            if (responseStream != null) {
+                try { responseStream.Dispose(); }
+                catch (Exception) { }
+            }
+            try {
+                CurlHttpTransport.CancelSend(state);
+            } catch (Exception) { }
+            throw exception;
+        }
+        return task;
+    }
+
+    public override void Dispose() {
+        _shareMutex.Lock();
+        try {
+            if (_disposeStarted) return;
+            _disposeStarted = true;
+            ptr connectionShare = _connectionShare;
+            _connectionShare = null;
+            try {
+                if (connectionShare != null) {
+                    CurlHttpTransport.ReleaseConnectionShare(connectionShare);
+                }
+            } finally {
+                MarkHandlerDisposed();
+            }
+        } finally {
+            _shareMutex.Unlock();
+        }
+    }
+}
+
+internal final class CurlHttpRequestState {
+    private Task<HttpResponseMessage> _completion;
+    private object _nativeOperation;
+    private CancellationTokenRegistration _cancellationRegistration;
+
+    internal object NativeOperation {
+        get => _nativeOperation;
+        set => _nativeOperation = value;
+    }
+
+    public constructor(Task<HttpResponseMessage> completion) {
+        _completion = completion;
+        _nativeOperation = null;
+        _cancellationRegistration = CancellationTokenRegistration.None;
+    }
+
+    internal void RegisterCancellation(CancellationToken cancellationToken) {
+        CurlHttpRequestState state = this;
+        _cancellationRegistration = cancellationToken.Register(
+            () => CurlHttpTransport.CancelSend(state));
+        try {
+            _completion.OnCompleted(() => state.ReleaseCancellationRegistration());
+        } catch (Exception exception) {
+            ReleaseCancellationRegistration();
+            throw exception;
+        }
+    }
+
+    private void ReleaseCancellationRegistration() {
+        CancellationTokenRegistration registration =
+            _cancellationRegistration;
+        _cancellationRegistration = CancellationTokenRegistration.None;
+        try {
+            registration.Dispose();
+        } catch (Exception) {
+            // The task is already complete; do not fault its scheduler callback.
+        }
+    }
+}
+
+// A bounded producer/consumer queue between an async CX stream and libcurl's
+// synchronous read callback. The callback never blocks waiting for source I/O.
+internal final class CurlUploadStream {
+    private const uint BufferCapacity = 65536u;
+    private Stream _source;
+    private CurlHttpRequestState _state;
+    private byte[] _buffer;
+    private uint _head;
+    private uint _count;
+    private bool _completed;
+    private bool _disposed;
+    private Exception _error;
+    private Task _spaceAvailable;
+    private TaskCompletionSource _spaceAvailableSource;
+    private CancellationTokenSource _pumpCancellation;
+    private CancellationTokenRegistration _callerCancellation;
+    private bool _pumpStarted;
+    private byte[] _pendingChunk;
+    private uint _pendingChunkLength;
+    private uint _pendingChunkOffset;
+    private Mutex _stateMutex;
+
+    public constructor(Stream source, CurlHttpRequestState state,
+        CancellationToken cancellationToken) {
+        _source = source;
+        _state = state;
+        _buffer = new byte[BufferCapacity];
+        _head = 0u;
+        _count = 0u;
+        _completed = false;
+        _disposed = false;
+        _error = null;
+        _spaceAvailable = null;
+        _spaceAvailableSource = null;
+        _pumpCancellation = new CancellationTokenSource();
+        _stateMutex = new Mutex();
+        _callerCancellation = cancellationToken.Register(
+            () => this.CancelProducer());
+        _pumpStarted = false;
+        _pendingChunk = null;
+        _pendingChunkLength = 0u;
+        _pendingChunkOffset = 0u;
+    }
+
+    internal void BeginPump() {
+        _stateMutex.Lock();
+        try {
+            if (_pumpStarted || _disposed) return;
+            _pumpStarted = true;
+        } finally {
+            _stateMutex.Unlock();
+        }
+        PumpNextSafely();
+    }
+
+    private void PumpNextSafely() {
+        try {
+            ReadNext();
+        } catch (OperationCanceledException) {
+            CompleteInput();
+        } catch (Exception exception) {
+            FailInput(exception);
+        }
+    }
+
+    private void ReadNext() {
+        Stream source = null;
+        CancellationToken pumpToken = CancellationToken.None;
+        bool complete = false;
+        _stateMutex.Lock();
+        try {
+            if (_disposed || _completed) return;
+            if (_pumpCancellation.IsCancellationRequested) {
+                complete = true;
+            } else {
+                source = _source;
+                pumpToken = _pumpCancellation.Token;
+            }
+        } finally {
+            _stateMutex.Unlock();
+        }
+        if (complete) {
+            CompleteInput();
+            return;
+        }
+        if (source == null) {
+            FailInput(new InvalidOperationException(
+                "The upload content stream is unavailable."));
+            return;
+        }
+        byte[] chunk = new byte[16384u];
+        Task<uint> read = null;
+        try {
+            read = source.ReadAsync(chunk, 0u, chunk.Length, pumpToken);
+            if (read == null) {
+                throw new InvalidOperationException(
+                    "The upload content stream returned no read task.");
+            }
+        } catch (OperationCanceledException) {
+            CompleteInput();
+            return;
+        } catch (Exception exception) {
+            FailInput(exception);
+            return;
+        }
+        CurlUploadStream upload = this;
+        try {
+            if (CurlHttpTransport.ShouldInjectUploadContinuationRegistrationFailure()) {
+                throw new InvalidOperationException(
+                    "Injected curl upload continuation registration failure.");
+            }
+            read.OnCompleted(() => upload.CompleteRead(read, chunk));
+        } catch (OperationCanceledException) {
+            CompleteInput();
+        } catch (Exception exception) {
+            FailInput(exception);
+        }
+    }
+
+    private void CompleteRead(Task<uint> read, byte[] chunk) {
+        uint count = 0u;
+        try {
+            count = read.GetResult();
+        } catch (OperationCanceledException) {
+            CompleteInput();
+            return;
+        } catch (Exception exception) {
+            FailInput(exception);
+            return;
+        }
+        if (count > chunk.Length) {
+            FailInput(new InvalidOperationException(
+                "The upload content stream returned more bytes than requested."));
+            return;
+        }
+        if (count == 0u) {
+            CompleteInput();
+            return;
+        }
+        bool accepted = false;
+        _stateMutex.Lock();
+        try {
+            if (!_disposed && !_completed) {
+                _pendingChunk = chunk;
+                _pendingChunkLength = count;
+                _pendingChunkOffset = 0u;
+                accepted = true;
+            }
+        } finally {
+            _stateMutex.Unlock();
+        }
+        if (accepted) ContinueWrite();
+    }
+
+    private void ContinueWrite() {
+        Task waitForSpace = null;
+        bool complete = false;
+        bool readNext = false;
+        _stateMutex.Lock();
+        try {
+            if (_disposed || _completed) return;
+            if (_pumpCancellation.IsCancellationRequested) {
+                complete = true;
+            } else while (_pendingChunkOffset < _pendingChunkLength) {
+                uint available = BufferCapacity - _count;
+                if (available == 0u) {
+                    if (_spaceAvailable == null) {
+                        TaskCompletionSource source = new TaskCompletionSource();
+                        _spaceAvailableSource = source;
+                        _spaceAvailable = source.Task;
+                        waitForSpace = _spaceAvailable;
+                    }
+                    break;
+                }
+                uint amount = _pendingChunkLength - _pendingChunkOffset < available
+                    ? _pendingChunkLength - _pendingChunkOffset : available;
+                uint tail = (_head + _count) % BufferCapacity;
+                uint first = amount < BufferCapacity - tail
+                    ? amount : BufferCapacity - tail;
+                for (uint index = 0u; index < first; index += 1u) {
+                    _buffer[tail + index] = _pendingChunk[_pendingChunkOffset + index];
+                }
+                for (uint index = first; index < amount; index += 1u) {
+                    _buffer[index - first] =
+                        _pendingChunk[_pendingChunkOffset + index];
+                }
+                _count += amount;
+                _pendingChunkOffset += amount;
+                CurlHttpTransport.ResumeUpload(_state);
+            }
+            if (!complete && _pendingChunkOffset == _pendingChunkLength) {
+                _pendingChunk = null;
+                _pendingChunkLength = 0u;
+                _pendingChunkOffset = 0u;
+                readNext = true;
+            }
+        } finally {
+            _stateMutex.Unlock();
+        }
+        if (complete) {
+            CompleteInput();
+            return;
+        }
+        if (waitForSpace != null) {
+            CurlUploadStream upload = this;
+            try {
+                waitForSpace.OnCompleted(() => upload.ContinueWrite());
+            } catch (Exception exception) {
+                FailInput(exception);
+            }
+            return;
+        }
+        if (readNext) PumpNextSafely();
+    }
+
+    internal byte[] ReadForCurl(uint maximumBytes) {
+        _stateMutex.Lock();
+        try {
+            if (_disposed) return new byte[0u];
+            if (_count == 0u) {
+                if (_error != null || _completed) return new byte[0u];
+                return null;
+            }
+            uint amount = _count < maximumBytes ? _count : maximumBytes;
+            byte[] result = new byte[amount];
+            uint first = amount < BufferCapacity - _head
+                ? amount : BufferCapacity - _head;
+            for (uint index = 0u; index < first; index += 1u) {
+                result[index] = _buffer[_head + index];
+            }
+            for (uint index = first; index < amount; index += 1u) {
+                result[index] = _buffer[index - first];
+            }
+            _head = (_head + amount) % BufferCapacity;
+            _count -= amount;
+            if (_spaceAvailable != null) {
+                TaskCompletionSource available = _spaceAvailableSource;
+                _spaceAvailable = null;
+                _spaceAvailableSource = null;
+                if (!available.Task.IsCompleted) available.SetResult();
+            }
+            return result;
+        } finally {
+            _stateMutex.Unlock();
+        }
+    }
+
+    internal bool HasFailure {
+        const get {
+            _stateMutex.Lock();
+            try { return _error != null; }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    private void CompleteInput() {
+        _stateMutex.Lock();
+        try {
+            if (_completed || _disposed) return;
+            _completed = true;
+            CurlHttpTransport.ResumeUpload(_state);
+        } finally {
+            _stateMutex.Unlock();
+        }
+    }
+
+    private void FailInput(Exception error) {
+        _stateMutex.Lock();
+        try {
+            if (_completed || _disposed) return;
+            _error = error;
+            _completed = true;
+            CurlHttpTransport.ResumeUpload(_state);
+        } finally {
+            _stateMutex.Unlock();
+        }
+    }
+
+    internal void CancelTransport() {
+        CancellationTokenRegistration callerCancellation =
+            CancellationTokenRegistration.None;
+        CancellationTokenSource pumpCancellation = null;
+        TaskCompletionSource spaceAvailableSource = null;
+        _stateMutex.Lock();
+        try {
+            if (_disposed) return;
+            _disposed = true;
+            callerCancellation = _callerCancellation;
+            pumpCancellation = _pumpCancellation;
+            spaceAvailableSource = _spaceAvailableSource;
+            _callerCancellation = CancellationTokenRegistration.None;
+            _pumpCancellation = null;
+            _spaceAvailable = null;
+            _spaceAvailableSource = null;
+            _source = null;
+            _buffer = null;
+            _pendingChunk = null;
+            _pendingChunkLength = 0u;
+            _pendingChunkOffset = 0u;
+            _state = null;
+        } finally {
+            _stateMutex.Unlock();
+        }
+        try {
+            callerCancellation.Dispose();
+        } catch (Exception) {
+            // Keep cleanup and the backpressure task terminal if unregister fails.
+        }
+        try {
+            if (pumpCancellation != null) pumpCancellation.Cancel();
+        } catch (Exception) {
+            // Cancellation still visits every registered callback before throwing.
+        }
+        if (spaceAvailableSource != null &&
+            !spaceAvailableSource.Task.IsCompleted) {
+            if (TaskScheduler.CanRunContinuationsOnCurrentThread()) {
+                spaceAvailableSource.SetCanceled();
+            } else {
+                TaskCompletionSource pending = spaceAvailableSource;
+                TaskScheduler.PostFromThread(() => pending.SetCanceled());
+            }
+        }
+    }
+
+    private void CancelProducer() {
+        CancellationTokenSource pumpCancellation = null;
+        _stateMutex.Lock();
+        try {
+            if (!_disposed) pumpCancellation = _pumpCancellation;
+        } finally {
+            _stateMutex.Unlock();
+        }
+        if (pumpCancellation != null) pumpCancellation.Cancel();
+    }
+}
+
+internal static class CurlHttpTransport {
+    internal static extern bool ShouldInjectBeginSendSetupFailure();
+    internal static extern bool ShouldInjectUploadContinuationRegistrationFailure();
+
+    internal static byte[] ReadContent(HttpContent content) {
+        return content.ReadAsByteArray();
+    }
+
+    internal static bool WasCanceled(Task<HttpResponseMessage> completion) {
+        return completion.IsCanceled;
+    }
+
+    internal static bool WasTimedOut(Task<HttpResponseMessage> completion) {
+        try {
+            completion.GetResult();
+        } catch (TimeoutException) {
+            return true;
+        } catch (Exception) {
+            return false;
+        }
+        return false;
+    }
+
+    internal static bool ExceededResponseContentBufferLimit(
+        Task<HttpResponseMessage> completion) {
+        try {
+            completion.GetResult();
+        } catch (HttpRequestException exception) {
+            return exception.Message ==
+                "The response exceeds MaxResponseContentBufferSize.";
+        } catch (Exception) {
+            return false;
+        }
+        return false;
+    }
+
+    internal static bool ExceededResponseHeaderLimits(
+        Task<HttpResponseMessage> completion) {
+        try {
+            completion.GetResult();
+        } catch (HttpRequestException exception) {
+            return exception.Message ==
+                "The response exceeds the configured header limits.";
+        } catch (Exception) {
+            return false;
+        }
+        return false;
+    }
+
+    internal static bool FailedResponseTransfer(
+        Task<HttpResponseMessage> completion) {
+        try {
+            completion.GetResult();
+        } catch (HttpRequestException) {
+            return true;
+        } catch (Exception) {
+            return true;
+        }
+        return false;
+    }
+
+    public static extern void BeginSend(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken,
+        Task<HttpResponseMessage> completion,
+        CurlHttpRequestState state,
+        uint maxResponseContentBufferSize,
+        bool automaticDecompression,
+        string caCertificateFile,
+        bool allowUnknownCertificateRevocation,
+        string proxyCaCertificateFile,
+        string proxy,
+        string proxyBypassList,
+        string proxyUsername,
+        string proxyPassword,
+        bool responseHeadersRead,
+        CurlResponseStream responseStream,
+        CurlUploadStream uploadStream,
+        uint maxConnectionsPerServer,
+        uint pooledConnectionIdleTimeoutMilliseconds,
+        uint pooledConnectionLifetimeMilliseconds,
+        ptr connectionShare);
+    public static extern ptr CreateConnectionShare();
+    public static extern void ReleaseConnectionShare(ptr connectionShare);
+    public static extern void CancelSend(CurlHttpRequestState state);
+    public static extern void ResumeStream(CurlHttpRequestState state);
+    public static extern void ResumeUpload(CurlHttpRequestState state);
+}

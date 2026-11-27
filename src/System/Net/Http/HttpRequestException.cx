@@ -1,0 +1,29 @@
+import System;
+
+namespace System.Net.Http;
+
+public class HttpRequestException : Exception {
+    private HttpStatusCode? _statusCode;
+
+    public HttpStatusCode? StatusCode { const get => _statusCode; }
+
+    public constructor(string message)
+        : base(message ?? "An HTTP request failed.") {
+        _statusCode = null;
+    }
+
+    public constructor(string message, Exception innerException)
+        : base(message ?? "An HTTP request failed.", innerException) {
+        _statusCode = null;
+    }
+
+    public constructor(HttpStatusCode statusCode, string message)
+        : base(message ?? "The HTTP response status was unsuccessful.") {
+        _statusCode = statusCode;
+    }
+
+    public constructor(HttpStatusCode statusCode, string message, Exception innerException)
+        : base(message ?? "The HTTP response status was unsuccessful.", innerException) {
+        _statusCode = statusCode;
+    }
+}

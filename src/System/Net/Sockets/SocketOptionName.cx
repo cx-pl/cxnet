@@ -1,0 +1,10 @@
+namespace System.Net.Sockets;
+
+public enum SocketOptionName {
+    NoDelay = 1,
+    KeepAlive = 2,
+    ReceiveBufferSize = 3,
+    SendBufferSize = 4,
+    DualMode = 5,
+    ReuseAddress = 6
+}

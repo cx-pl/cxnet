@@ -1,0 +1,123 @@
+import System;
+import System.Net.Http;
+import System.Threading.Tasks;
+
+namespace HttpCharset;
+
+public bool HasBytes(byte[] actual, uint first, uint second, uint third,
+    uint fourth) {
+    return actual != null && actual.Length == 4u &&
+        (uint)actual[0u] == first && (uint)actual[1u] == second &&
+        (uint)actual[2u] == third && (uint)actual[3u] == fourth;
+}
+
+public int Main(string[] args) {
+    StringContent latin1 = new StringContent("café", "text/plain",
+        "iso-8859-1");
+    byte[] encodedLatin1 = latin1.ReadAsByteArray();
+    if (!HasBytes(encodedLatin1, 0x63u, 0x61u, 0x66u, 0xE9u) ||
+        latin1.Headers.GetFirstValue("Content-Type") !=
+            "text/plain; charset=iso-8859-1") {
+        latin1.Dispose();
+        return 1;
+    }
+
+    ByteArrayContent latin1Response = new ByteArrayContent(encodedLatin1);
+    latin1Response.Headers.Add("Content-Type",
+        "text/plain; charset=latin1");
+    bool latin1Decoded = latin1Response.ReadAsString() == "café" &&
+        latin1Response.ReadAsString("ISO-8859-1") == "café";
+    Task<string> asyncLatin1 = latin1Response.ReadAsStringAsync("latin1");
+    uint asyncSteps = 0u;
+    while (!asyncLatin1.IsCompleted && asyncSteps < 10000u) {
+        if (!TaskScheduler.RunOne()) break;
+        asyncSteps += 1u;
+    }
+    bool asyncLatin1Decoded = false;
+    if (asyncLatin1.IsCompleted && !asyncLatin1.IsFaulted &&
+        !asyncLatin1.IsCanceled) {
+        try {
+            asyncLatin1Decoded = asyncLatin1.GetResult() == "café";
+        } catch (Exception) { }
+    }
+    bool asciiDecodeRejected = false;
+    try {
+        string unexpectedAscii = latin1Response.ReadAsString("us-ascii");
+    } catch (EncodingException exception) {
+        asciiDecodeRejected = exception.Position == 3u;
+    }
+    bool unknownReadCharsetRejected = false;
+    try {
+        string unexpectedEncoding = latin1Response.ReadAsString("x-cx-unknown");
+    } catch (NotSupportedException) {
+        unknownReadCharsetRejected = true;
+    }
+    Task<string> asyncUnknown =
+        latin1Response.ReadAsStringAsync("x-cx-unknown");
+    asyncSteps = 0u;
+    while (!asyncUnknown.IsCompleted && asyncSteps < 10000u) {
+        if (!TaskScheduler.RunOne()) break;
+        asyncSteps += 1u;
+    }
+    bool asyncUnknownRejected = false;
+    if (asyncUnknown.IsCompleted && asyncUnknown.IsFaulted &&
+        !asyncUnknown.IsCanceled) {
+        try {
+            string unexpectedAsyncText = asyncUnknown.GetResult();
+        } catch (NotSupportedException) {
+            asyncUnknownRejected = true;
+        }
+    }
+    latin1Response.Dispose();
+    latin1.Dispose();
+    if (!latin1Decoded || !asyncLatin1Decoded || !asciiDecodeRejected ||
+        !unknownReadCharsetRejected || !asyncUnknownRejected) return 2;
+
+    StringContent ascii = new StringContent("safe", "text/plain", "ascii");
+    bool asciiEncoded = HasBytes(ascii.ReadAsByteArray(), 0x73u, 0x61u,
+        0x66u, 0x65u);
+    ascii.Dispose();
+    if (!asciiEncoded) return 3;
+
+    bool unrepresentableRejected = false;
+    try {
+        StringContent invalidAscii = new StringContent("café", "text/plain",
+            "us-ascii");
+        invalidAscii.Dispose();
+    } catch (EncodingException exception) {
+        unrepresentableRejected = exception.Position == 3u;
+    }
+    if (!unrepresentableRejected) return 4;
+
+    bool unsupportedRejected = false;
+    try {
+        StringContent unsupported = new StringContent("safe", "text/plain",
+            "x-cx-unknown");
+        unsupported.Dispose();
+    } catch (NotSupportedException) {
+        unsupportedRejected = true;
+    }
+    if (!unsupportedRejected) return 5;
+
+    bool mismatchedContentTypeRejected = false;
+    try {
+        StringContent mismatch = new StringContent("safe",
+            "text/plain; charset=utf-8", "iso-8859-1");
+        mismatch.Dispose();
+    } catch (ArgumentException) {
+        mismatchedContentTypeRejected = true;
+    }
+    if (!mismatchedContentTypeRejected) return 6;
+
+    ByteArrayContent duplicateCharset = new ByteArrayContent(new byte[0u]);
+    duplicateCharset.Headers.Add("Content-Type",
+        "text/plain; charset=utf-8; charset=us-ascii");
+    bool duplicateCharsetRejected = false;
+    try {
+        string unexpectedText = duplicateCharset.ReadAsString();
+    } catch (FormatException) {
+        duplicateCharsetRejected = true;
+    }
+    duplicateCharset.Dispose();
+    return duplicateCharsetRejected ? 0 : 7;
+}

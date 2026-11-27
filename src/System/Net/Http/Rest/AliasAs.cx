@@ -1,0 +1,8 @@
+import System;
+
+namespace System.Net.Http.Rest;
+
+@AnnotationUsage(targets = "parameter")
+public final class AliasAs : Annotation {
+    public constructor(string name) {}
+}

@@ -1,0 +1,1233 @@
+import System;
+import System.IO;
+import System.Net.Http;
+import System.Threading;
+import System.Threading.Tasks;
+
+namespace StreamCopy;
+
+public class ReadFailureStream : Stream {
+    public override bool CanRead { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new IOException("injected read failure");
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new IOException("stream is not writable");
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { }
+}
+
+public class AsyncReadSetupFailureStream : Stream {
+    private uint _disposeCount;
+
+    public uint DisposeCount { get { return _disposeCount; } }
+
+    public override bool CanRead { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset,
+        uint count, CancellationToken cancellationToken) {
+        throw new IOException("injected async read setup failure");
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { _disposeCount += 1u; }
+}
+
+public class NullReadTaskStream : Stream {
+    public override bool CanRead { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset,
+        uint count, CancellationToken cancellationToken) { return null; }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { }
+}
+
+public class NullWriteTaskStream : Stream {
+    public override bool CanWrite { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override Task WriteAsync(byte[] buffer, uint offset, uint count,
+        CancellationToken cancellationToken) { return null; }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { }
+}
+
+public class OverReportingStream : Stream {
+    public override bool CanRead { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        return (int)(count + 1u);
+    }
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset,
+        uint count, CancellationToken cancellationToken) {
+        Task<uint> result = new Task<uint>();
+        result.SetResult(count + 1u);
+        return result;
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { }
+}
+
+public class WriteFailureStream : Stream {
+    public override bool CanWrite { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new IOException("injected write failure");
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { }
+}
+
+public class AsyncWriteSetupFailureStream : Stream {
+    public override bool CanWrite { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override Task WriteAsync(byte[] buffer, uint offset, uint count,
+        CancellationToken cancellationToken) {
+        throw new IOException("injected async write setup failure");
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { }
+}
+
+public class PendingReadStream : Stream {
+    public override bool CanRead { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset,
+        uint count, CancellationToken cancellationToken) {
+        Task<uint> pendingRead = new Task<uint>();
+        cancellationToken.Register(() => pendingRead.SetCanceled());
+        return pendingRead;
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { }
+}
+
+public class LateDataReadStream : Stream {
+    private Task<uint> _pendingRead;
+    private byte[] _buffer;
+    private uint _offset;
+    private uint _readCalls;
+
+    public uint ReadCalls { get { return _readCalls; } }
+
+    public override bool CanRead { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset,
+        uint count, CancellationToken cancellationToken) {
+        _readCalls += 1u;
+        _buffer = buffer;
+        _offset = offset;
+        _pendingRead = new Task<uint>();
+        return _pendingRead;
+    }
+    public void CompleteWithByte(uint value) {
+        _buffer[_offset] = (byte)value;
+        _pendingRead.SetResult(1u);
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { }
+}
+
+public class CountingWriteStream : Stream {
+    private uint _writeCalls;
+
+    public uint WriteCalls { get { return _writeCalls; } }
+
+    public override bool CanWrite { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        _writeCalls += 1u;
+    }
+    public override Task WriteAsync(byte[] buffer, uint offset, uint count,
+        CancellationToken cancellationToken) {
+        _writeCalls += 1u;
+        Task completedWrite = new Task();
+        completedWrite.SetResult();
+        return completedWrite;
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { }
+}
+
+public class OneByteReadStream : Stream {
+    private uint _readCalls;
+
+    public uint ReadCalls { get { return _readCalls; } }
+
+    public override bool CanRead { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset,
+        uint count, CancellationToken cancellationToken) {
+        _readCalls += 1u;
+        Task<uint> result = new Task<uint>();
+        if (_readCalls == 1u) {
+            buffer[offset] = (byte)0x5Cu;
+            result.SetResult(1u);
+        } else {
+            result.SetResult(0u);
+        }
+        return result;
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { }
+}
+
+public class DisposeAwareOneByteReadStream : Stream {
+    private uint _readCalls;
+    private uint _disposeCount;
+    public AtomicInt Disposed;
+
+    public uint ReadCalls { get { return _readCalls; } }
+    public uint DisposeCount { get { return _disposeCount; } }
+
+    public constructor() { Disposed = new AtomicInt(0); }
+
+    public override bool CanRead { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset,
+        uint count, CancellationToken cancellationToken) {
+        _readCalls += 1u;
+        if (Disposed.Value != 0)
+            throw new ObjectDisposedException("DisposeAwareOneByteReadStream");
+        Task<uint> result = new Task<uint>();
+        if (_readCalls == 1u) {
+            buffer[offset] = (byte)0x6Bu;
+            result.SetResult(1u);
+        } else {
+            result.SetResult(0u);
+        }
+        return result;
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() {
+        _disposeCount += 1u;
+        Disposed.Exchange(1);
+    }
+}
+
+public class PendingWriteStream : Stream {
+    private TaskCompletionSource _pendingWrite;
+    private uint _writeCalls;
+
+    public Task PendingWrite {
+        get { return _pendingWrite == null ? null : _pendingWrite.Task; }
+    }
+    public uint WriteCalls { get { return _writeCalls; } }
+
+    public override bool CanWrite { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override Task WriteAsync(byte[] buffer, uint offset, uint count,
+        CancellationToken cancellationToken) {
+        _writeCalls += 1u;
+        _pendingWrite = new TaskCompletionSource();
+        return _pendingWrite.Task;
+    }
+    public void CompleteWrite() { _pendingWrite.SetResult(); }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { }
+}
+
+public class DisposePendingWriteStream : Stream {
+    private TaskCompletionSource _pendingWrite;
+    private bool _disposed;
+    private uint _disposeCount;
+    private uint _writeCalls;
+
+    public Task PendingWrite {
+        get { return _pendingWrite == null ? null : _pendingWrite.Task; }
+    }
+    public uint DisposeCount { get { return _disposeCount; } }
+    public uint WriteCalls { get { return _writeCalls; } }
+
+    public override bool CanWrite { get { return !_disposed; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override Task WriteAsync(byte[] buffer, uint offset, uint count,
+        CancellationToken cancellationToken) {
+        _writeCalls += 1u;
+        _pendingWrite = new TaskCompletionSource();
+        return _pendingWrite.Task;
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() {
+        if (_disposed) return;
+        _disposed = true;
+        _disposeCount += 1u;
+        if (_pendingWrite != null && !_pendingWrite.Task.IsCompleted) {
+            _pendingWrite.SetException(
+                new ObjectDisposedException("DisposePendingWriteStream"));
+        }
+    }
+}
+
+public class DisposeDuringReadStream : Stream {
+    private Task<uint> _pendingRead;
+    private uint _disposeCount;
+
+    public uint DisposeCount { get { return _disposeCount; } }
+    public bool ReadPending {
+        get { return _pendingRead != null && !_pendingRead.IsCompleted; }
+    }
+
+    public override bool CanRead { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset,
+        uint count, CancellationToken cancellationToken) {
+        _pendingRead = new Task<uint>();
+        return _pendingRead;
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() {
+        _disposeCount += 1u;
+        if (_pendingRead != null && !_pendingRead.IsCompleted) {
+            _pendingRead.SetFault(
+                new ObjectDisposedException("DisposeDuringReadStream"));
+        }
+    }
+}
+
+public class TrackedMemoryStream : Stream {
+    private MemoryStream _inner;
+    public AtomicInt DisposeCount;
+
+    public constructor() {
+        _inner = new MemoryStream();
+        DisposeCount = new AtomicInt(0);
+    }
+
+    public override bool CanRead { get => true; }
+    public override bool CanWrite { get => true; }
+    public override bool CanSeek { get => true; }
+    public override long Length { get => _inner.Length; }
+    public override long Position {
+        get => _inner.Position;
+        set => _inner.Position = value;
+    }
+    public override void Flush() { _inner.Flush(); }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        return _inner.Read(buffer, offset, count);
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        _inner.Write(buffer, offset, count);
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        return _inner.Seek(offset, origin);
+    }
+    public override void SetLength(long value) { _inner.SetLength(value); }
+
+    public override void Dispose() {
+        DisposeCount.Increment();
+        _inner.Dispose();
+    }
+}
+
+public class StreamContentReadDisposeRace {
+    public StreamContent Content;
+    public byte[] Expected;
+    public AtomicInt Start;
+    public AtomicInt ReadStarted;
+    public AtomicInt Outcome;
+
+    public constructor(StreamContent content, byte[] expected) {
+        Content = content;
+        Expected = expected;
+        Start = new AtomicInt(0);
+        ReadStarted = new AtomicInt(0);
+        Outcome = new AtomicInt(0);
+    }
+
+    public void Read() {
+        while (Start.Value == 0) Thread.Yield();
+        ReadStarted.Exchange(1);
+        try {
+            byte[] actual = Content.ReadAsByteArray();
+            if (actual.Length == Expected.Length &&
+                actual[0u] == Expected[0u] &&
+                actual[Expected.Length / 2u] == Expected[Expected.Length / 2u] &&
+                actual[Expected.Length - 1u] == Expected[Expected.Length - 1u]) {
+                Outcome.Exchange(1);
+            } else {
+                Outcome.Exchange(2);
+            }
+        } catch (ObjectDisposedException) {
+            Outcome.Exchange(3);
+        } catch (Exception) {
+            Outcome.Exchange(4);
+        }
+    }
+}
+
+public class StreamCopyWriteDisposeRace {
+    public StreamContent Content;
+    public CancellationTokenSource Cancellation;
+    public AtomicInt Start;
+    public AtomicInt DisposeFailed;
+
+    public constructor(StreamContent content,
+        CancellationTokenSource cancellation) {
+        Content = content;
+        Cancellation = cancellation;
+        Start = new AtomicInt(0);
+        DisposeFailed = new AtomicInt(0);
+    }
+
+    public void DisposeAndCancel() {
+        while (Start.Value == 0) Thread.Yield();
+        try {
+            Content.Dispose();
+            Cancellation.Cancel();
+        } catch (Exception) {
+            DisposeFailed.Exchange(1);
+        }
+    }
+}
+
+public class DataThenPendingEofStream : Stream {
+    private uint _readCount;
+    private Task<uint> _pendingEofRead;
+
+    public Task<uint> PendingEofRead {
+        get { return _pendingEofRead; }
+    }
+
+    public override bool CanRead { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset,
+        uint count, CancellationToken cancellationToken) {
+        _readCount += 1u;
+        if (_readCount == 1u) {
+            buffer[offset] = (byte)0x7Au;
+            Task<uint> dataRead = new Task<uint>();
+            dataRead.SetResult(1u);
+            return dataRead;
+        }
+        _pendingEofRead = new Task<uint>();
+        return _pendingEofRead;
+    }
+    public void CompleteEof() {
+        _pendingEofRead.SetResult(0u);
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { }
+}
+
+public class NonSeekablePayloadStream : Stream {
+    private byte[] _bytes;
+    private uint _position;
+
+    public constructor(byte[] bytes) {
+        _bytes = bytes;
+        _position = 0u;
+    }
+
+    public override bool CanRead { get { return true; } }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        uint available = _position < _bytes.Length
+            ? _bytes.Length - _position : 0u;
+        uint copied = count < available ? count : available;
+        for (uint index = 0u; index < copied; index += 1u) {
+            buffer[offset + index] = _bytes[_position + index];
+        }
+        _position += copied;
+        return (int)copied;
+    }
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        throw new NotSupportedException();
+    }
+    public override long Seek(long offset, SeekOrigin origin) {
+        throw new NotSupportedException();
+    }
+    public override void SetLength(long value) {
+        throw new NotSupportedException();
+    }
+    public override void Dispose() { }
+}
+
+public bool Finish(Task pending) {
+    uint steps = 0u;
+    while (!pending.IsCompleted && steps < 10000u) {
+        if (!TaskScheduler.RunOne()) break;
+        steps += 1u;
+    }
+    return pending.IsCompleted;
+}
+
+public bool IsIoFault(Task pending) {
+    if (!pending.IsCompleted || !pending.IsFaulted || pending.IsCanceled) {
+        return false;
+    }
+    try {
+        pending.GetResult();
+    } catch (IOException) {
+        return true;
+    } catch (Exception) { }
+    return false;
+}
+
+public bool IsCanceled(Task pending) {
+    if (!pending.IsCompleted || pending.IsFaulted || !pending.IsCanceled) {
+        return false;
+    }
+    try {
+        pending.GetResult();
+    } catch (OperationCanceledException) {
+        return true;
+    } catch (Exception) { }
+    return false;
+}
+
+public bool FinishBytes(Task<byte[]> pending) {
+    uint steps = 0u;
+    while (!pending.IsCompleted && steps < 10000u) {
+        if (!TaskScheduler.RunOne()) break;
+        steps += 1u;
+    }
+    return pending.IsCompleted;
+}
+
+public bool IsIoFault(Task<byte[]> pending) {
+    if (!pending.IsCompleted || !pending.IsFaulted || pending.IsCanceled) {
+        return false;
+    }
+    try {
+        byte[] unexpected = pending.GetResult();
+    } catch (IOException) {
+        return true;
+    } catch (Exception) { }
+    return false;
+}
+
+public bool IsInvalidOperationFault(Task pending) {
+    if (!pending.IsCompleted || !pending.IsFaulted || pending.IsCanceled) {
+        return false;
+    }
+    try {
+        pending.GetResult();
+    } catch (InvalidOperationException) {
+        return true;
+    } catch (Exception) { }
+    return false;
+}
+
+public bool IsInvalidOperationFault(Task<byte[]> pending) {
+    if (!pending.IsCompleted || !pending.IsFaulted || pending.IsCanceled) {
+        return false;
+    }
+    try {
+        byte[] unexpected = pending.GetResult();
+    } catch (InvalidOperationException) {
+        return true;
+    } catch (Exception) { }
+    return false;
+}
+
+public bool IsArgumentNullFault(Task pending) {
+    if (!pending.IsCompleted || !pending.IsFaulted || pending.IsCanceled) {
+        return false;
+    }
+    try {
+        pending.GetResult();
+    } catch (ArgumentNullException) {
+        return true;
+    } catch (Exception) { }
+    return false;
+}
+
+public bool IsArgumentFault(Task pending) {
+    if (!pending.IsCompleted || !pending.IsFaulted || pending.IsCanceled) {
+        return false;
+    }
+    try {
+        pending.GetResult();
+    } catch (ArgumentException) {
+        return true;
+    } catch (Exception) { }
+    return false;
+}
+
+public bool IsNotSupportedFault(Task pending) {
+    if (!pending.IsCompleted || !pending.IsFaulted || pending.IsCanceled) {
+        return false;
+    }
+    try {
+        pending.GetResult();
+    } catch (NotSupportedException) {
+        return true;
+    } catch (Exception) { }
+    return false;
+}
+
+public bool IsCanceled(Task<byte[]> pending) {
+    if (!pending.IsCompleted || pending.IsFaulted || !pending.IsCanceled) {
+        return false;
+    }
+    try {
+        byte[] unexpected = pending.GetResult();
+    } catch (OperationCanceledException) {
+        return true;
+    } catch (Exception) { }
+    return false;
+}
+
+public bool HasBytes(MemoryStream stream, uint first, uint second,
+    uint third) {
+    byte[] actual = stream.ToArray();
+    return actual.Length == 3u && (uint)actual[0u] == first &&
+        (uint)actual[1u] == second && (uint)actual[2u] == third;
+}
+
+public bool HasFourBytes(MemoryStream stream) {
+    byte[] actual = stream.ToArray();
+    return actual.Length == 4u && (uint)actual[0u] == 0x10u &&
+        (uint)actual[1u] == 0x20u && (uint)actual[2u] == 0x30u &&
+        (uint)actual[3u] == 0x40u;
+}
+
+public bool HasOneByte(MemoryStream stream, uint expected) {
+    byte[] actual = stream.ToArray();
+    return actual.Length == 1u && (uint)actual[0u] == expected;
+}
+
+public bool WaitForPendingEofRead(DataThenPendingEofStream source) {
+    uint steps = 0u;
+    while (source.PendingEofRead == null && steps < 10000u) {
+        if (!TaskScheduler.RunOne()) break;
+        steps += 1u;
+    }
+    return source.PendingEofRead != null;
+}
+
+public bool WaitForPendingWrite(PendingWriteStream destination) {
+    uint steps = 0u;
+    while (destination.PendingWrite == null && steps < 10000u) {
+        if (!TaskScheduler.RunOne()) break;
+        steps += 1u;
+    }
+    return destination.PendingWrite != null;
+}
+
+public bool WaitForPendingWrite(DisposePendingWriteStream destination) {
+    uint steps = 0u;
+    while (destination.PendingWrite == null && steps < 10000u) {
+        if (!TaskScheduler.RunOne()) break;
+        steps += 1u;
+    }
+    return destination.PendingWrite != null;
+}
+
+public byte[] FourBytes() {
+    byte[] bytes = new byte[4u];
+    bytes[0u] = (byte)0x10u;
+    bytes[1u] = (byte)0x20u;
+    bytes[2u] = (byte)0x30u;
+    bytes[3u] = (byte)0x40u;
+    return bytes;
+}
+
+public byte[] OneByte(uint value) {
+    byte[] bytes = new byte[1u];
+    bytes[0u] = (byte)value;
+    return bytes;
+}
+
+public int Main(string[] args) {
+    Task nullDestinationCopy = new MemoryStream(FourBytes()).CopyToAsync(null);
+    if (!Finish(nullDestinationCopy) ||
+        !IsArgumentNullFault(nullDestinationCopy)) return 51;
+
+    MemoryStream writableCheckSource = new MemoryStream(FourBytes());
+    MemoryStream closedDestination = new MemoryStream();
+    closedDestination.Dispose();
+    Task closedDestinationCopy = writableCheckSource.CopyToAsync(
+        closedDestination);
+    if (!Finish(closedDestinationCopy) ||
+        !IsArgumentFault(closedDestinationCopy)) return 52;
+
+    MemoryStream closedSource = new MemoryStream(FourBytes());
+    closedSource.Dispose();
+    Task closedSourceCopy = closedSource.CopyToAsync(new MemoryStream());
+    if (!Finish(closedSourceCopy) ||
+        !IsNotSupportedFault(closedSourceCopy)) return 53;
+
+    MemoryStream source = new MemoryStream(FourBytes());
+    source.Position = 1L;
+    MemoryStream destination = new MemoryStream();
+    if (!source.CanRead || !destination.CanWrite) {
+        Console.WriteLine("memory stream capability check failed");
+        return 10;
+    }
+    Task copied = source.CopyToAsync(destination);
+    if (!Finish(copied)) return 11;
+    if (copied.IsFaulted) {
+        try { copied.GetResult(); }
+        catch (Exception exception) {
+            Console.WriteLine(exception.Message);
+            return 12;
+        }
+    }
+    if (copied.IsCanceled || !HasBytes(destination, 0x20u, 0x30u, 0x40u)) {
+        return 1;
+    }
+
+    MemoryStream contentSource = new MemoryStream(FourBytes());
+    contentSource.Position = 1L;
+    StreamContent content = new StreamContent(contentSource, 16u, true);
+    MemoryStream contentDestination = new MemoryStream();
+    Task contentCopy = content.CopyToAsync(contentDestination);
+    if (!Finish(contentCopy) || contentCopy.IsFaulted ||
+        contentCopy.IsCanceled ||
+        !HasBytes(contentDestination, 0x20u, 0x30u, 0x40u)) return 2;
+    content.Dispose();
+
+    MemoryStream replaySource = new MemoryStream(FourBytes());
+    replaySource.Position = 1L;
+    StreamContent replayable = new StreamContent(replaySource, 16u, true);
+    byte[] firstBuffer = replayable.ReadAsByteArray();
+    byte[] repeatedBuffer = replayable.ReadAsByteArray();
+    if (firstBuffer.Length != 3u || repeatedBuffer.Length != 3u ||
+        (uint)firstBuffer[0u] != 0x20u ||
+        (uint)repeatedBuffer[2u] != 0x40u) return 8;
+    replayable.Dispose();
+
+    MemoryStream limitedSource = new MemoryStream(FourBytes());
+    limitedSource.Position = 1L;
+    StreamContent limitedContent = new StreamContent(limitedSource, 2u, true);
+    Task<byte[]> limitedRead = limitedContent.ReadAsByteArrayAsync();
+    if (!FinishBytes(limitedRead) || !IsIoFault(limitedRead) ||
+        limitedSource.Position != 1L) return 9;
+    limitedContent.Dispose();
+
+    NonSeekablePayloadStream nonSeekableSource =
+        new NonSeekablePayloadStream(FourBytes());
+    StreamContent streamingContent = new StreamContent(
+        nonSeekableSource, 16u, true);
+    MemoryStream streamingDestination = new MemoryStream();
+    Task streamingCopy = streamingContent.CopyToAsync(streamingDestination);
+    if (!Finish(streamingCopy) || streamingCopy.IsFaulted ||
+        streamingCopy.IsCanceled || !HasFourBytes(streamingDestination)) return 10;
+    Task<byte[]> replayOfStream = streamingContent.ReadAsByteArrayAsync();
+    if (!FinishBytes(replayOfStream) || !IsIoFault(replayOfStream)) return 11;
+    streamingContent.Dispose();
+
+    DisposeDuringReadStream disposingSource = new DisposeDuringReadStream();
+    StreamContent disposingContent = new StreamContent(
+        disposingSource, 16u, false);
+    Task<byte[]> pendingBuffer = disposingContent.ReadAsByteArrayAsync();
+    if (pendingBuffer.IsCompleted) return 12;
+    Task<byte[]> cachedBufferTask = disposingContent.ReadAsByteArrayAsync();
+    if (cachedBufferTask != pendingBuffer) return 16;
+    disposingContent.Dispose();
+    disposingContent.Dispose();
+    if (!FinishBytes(pendingBuffer)) return 13;
+    if (!IsCanceled(pendingBuffer)) return 14;
+    if (disposingSource.DisposeCount != 1u) return 15;
+
+    DisposeDuringReadStream disposingCopySource =
+        new DisposeDuringReadStream();
+    StreamContent disposingCopyContent = new StreamContent(
+        disposingCopySource, 16u, false);
+    Task pendingStreamContentCopy = disposingCopyContent.CopyToAsync(
+        new MemoryStream());
+    if (!disposingCopySource.ReadPending || pendingStreamContentCopy.IsCompleted)
+        return 34;
+    disposingCopyContent.Dispose();
+    disposingCopyContent.Dispose();
+    if (disposingCopySource.DisposeCount != 1u ||
+        !Finish(pendingStreamContentCopy) ||
+        !pendingStreamContentCopy.IsFaulted ||
+        pendingStreamContentCopy.IsCanceled) return 35;
+    bool disposeDuringCopyReadFaultObserved = false;
+    try {
+        pendingStreamContentCopy.GetResult();
+    } catch (ObjectDisposedException) {
+        disposeDuringCopyReadFaultObserved = true;
+    }
+    if (!disposeDuringCopyReadFaultObserved ||
+        disposingCopySource.DisposeCount != 1u) return 36;
+
+    CancellationTokenSource eofCancellation = new CancellationTokenSource();
+    DataThenPendingEofStream eofSource = new DataThenPendingEofStream();
+    MemoryStream eofDestination = new MemoryStream();
+    Task eofCopy = eofSource.CopyToAsync(eofDestination,
+        eofCancellation.Token);
+    if (!WaitForPendingEofRead(eofSource) ||
+        !HasOneByte(eofDestination, 0x7Au) || eofCopy.IsCompleted) return 17;
+    eofCancellation.Cancel();
+    eofSource.CompleteEof();
+    if (!Finish(eofCopy) || !IsCanceled(eofCopy)) return 18;
+
+    OverReportingStream overReportingCopySource = new OverReportingStream();
+    Task overReportedCopy = overReportingCopySource.CopyToAsync(
+        new MemoryStream());
+    if (!Finish(overReportedCopy) ||
+        !IsInvalidOperationFault(overReportedCopy)) return 19;
+
+    StreamContent overReportingContent = new StreamContent(
+        new OverReportingStream(), 16u, true);
+    Task<byte[]> overReportedBuffer =
+        overReportingContent.ReadAsByteArrayAsync();
+    if (!FinishBytes(overReportedBuffer) ||
+        !IsInvalidOperationFault(overReportedBuffer)) return 20;
+    overReportingContent.Dispose();
+
+    AsyncReadSetupFailureStream asyncMaterializationSource =
+        new AsyncReadSetupFailureStream();
+    StreamContent asyncMaterializationContent = new StreamContent(
+        asyncMaterializationSource, 16u, false);
+    Task<byte[]> asyncMaterializationFailure =
+        asyncMaterializationContent.ReadAsByteArrayAsync();
+    if (!FinishBytes(asyncMaterializationFailure) ||
+        !IsIoFault(asyncMaterializationFailure)) return 44;
+    Task<byte[]> retryAfterSetupFailure =
+        asyncMaterializationContent.ReadAsByteArrayAsync();
+    if (retryAfterSetupFailure != asyncMaterializationFailure ||
+        !IsIoFault(retryAfterSetupFailure) ||
+        asyncMaterializationSource.DisposeCount != 0u) return 45;
+    asyncMaterializationContent.Dispose();
+    asyncMaterializationContent.Dispose();
+    if (asyncMaterializationSource.DisposeCount != 1u) return 46;
+
+    StreamContent throwingContinuationContent = new StreamContent(
+        new OverReportingStream(), 16u, true);
+    Task<byte[]> throwingContinuationBuffer =
+        throwingContinuationContent.ReadAsByteArrayAsync();
+    bool continuationThrew = false;
+    throwingContinuationBuffer.OnCompleted(() => {
+        throw new InvalidOperationException("injected completion continuation failure");
+    });
+    uint continuationSteps = 0u;
+    while (!continuationThrew && continuationSteps < 10000u) {
+        try {
+            if (!TaskScheduler.RunOne()) break;
+        } catch (InvalidOperationException) {
+            continuationThrew = true;
+        }
+        continuationSteps += 1u;
+    }
+    if (!continuationThrew ||
+        !IsInvalidOperationFault(throwingContinuationBuffer)) {
+        Console.WriteLine("throwing continuation did not leave a faulted materialization task");
+        return 21;
+    }
+    Task<byte[]> retryAfterContinuationFailure =
+        throwingContinuationContent.ReadAsByteArrayAsync();
+    if (retryAfterContinuationFailure != throwingContinuationBuffer ||
+        !IsInvalidOperationFault(retryAfterContinuationFailure)) {
+        Console.WriteLine("throwing continuation changed the cached materialization result");
+        return 22;
+    }
+    throwingContinuationContent.Dispose();
+
+    ReadFailureStream failingSource = new ReadFailureStream();
+    MemoryStream failureDestination = new MemoryStream();
+    Task readFailure = failingSource.CopyToAsync(failureDestination);
+    if (!Finish(readFailure) || !IsIoFault(readFailure)) return 3;
+
+    AsyncReadSetupFailureStream asyncSetupFailingSource =
+        new AsyncReadSetupFailureStream();
+    Task asyncReadSetupFailure = asyncSetupFailingSource.CopyToAsync(
+        new MemoryStream());
+    if (!Finish(asyncReadSetupFailure) || !IsIoFault(asyncReadSetupFailure))
+        return 26;
+
+    Task nullReadTask = new NullReadTaskStream().CopyToAsync(
+        new MemoryStream());
+    if (!Finish(nullReadTask) || !IsInvalidOperationFault(nullReadTask))
+        return 37;
+
+    MemoryStream writeSource = new MemoryStream(OneByte(0x55u));
+    WriteFailureStream failingDestination = new WriteFailureStream();
+    Task writeFailure = writeSource.CopyToAsync(failingDestination);
+    if (!Finish(writeFailure) || !IsIoFault(writeFailure)) return 4;
+
+    OneByteReadStream destinationDisposeSource = new OneByteReadStream();
+    DisposePendingWriteStream disposedDestination =
+        new DisposePendingWriteStream();
+    Task destinationDisposeCopy = destinationDisposeSource.CopyToAsync(
+        disposedDestination);
+    if (!WaitForPendingWrite(disposedDestination) ||
+        destinationDisposeCopy.IsCompleted ||
+        destinationDisposeSource.ReadCalls != 1u ||
+        disposedDestination.WriteCalls != 1u) return 54;
+    disposedDestination.Dispose();
+    disposedDestination.Dispose();
+    if (!Finish(destinationDisposeCopy) ||
+        !destinationDisposeCopy.IsFaulted ||
+        destinationDisposeCopy.IsCanceled ||
+        destinationDisposeSource.ReadCalls != 1u ||
+        disposedDestination.WriteCalls != 1u ||
+        disposedDestination.DisposeCount != 1u) return 55;
+    bool destinationDisposeFaultObserved = false;
+    try {
+        destinationDisposeCopy.GetResult();
+    } catch (ObjectDisposedException) {
+        destinationDisposeFaultObserved = true;
+    }
+    if (!destinationDisposeFaultObserved) return 56;
+
+    AsyncWriteSetupFailureStream asyncSetupFailingDestination =
+        new AsyncWriteSetupFailureStream();
+    Task asyncWriteSetupFailure = new MemoryStream(OneByte(0x67u))
+        .CopyToAsync(asyncSetupFailingDestination);
+    if (!Finish(asyncWriteSetupFailure) || !IsIoFault(asyncWriteSetupFailure))
+        return 27;
+
+    Task nullWriteTask = new MemoryStream(OneByte(0x68u)).CopyToAsync(
+        new NullWriteTaskStream());
+    if (!Finish(nullWriteTask) || !IsInvalidOperationFault(nullWriteTask))
+        return 38;
+
+    CancellationTokenSource cancellation = new CancellationTokenSource();
+    cancellation.Cancel();
+    MemoryStream canceledSource = new MemoryStream(OneByte(0x66u));
+    MemoryStream canceledDestination = new MemoryStream();
+    Task canceled = canceledSource.CopyToAsync(canceledDestination,
+        cancellation.Token);
+    if (!Finish(canceled) || !IsCanceled(canceled)) return 5;
+
+    CancellationTokenSource pendingCancellation = new CancellationTokenSource();
+    PendingReadStream pendingSource = new PendingReadStream();
+    MemoryStream pendingDestination = new MemoryStream();
+    Task pendingCopy = pendingSource.CopyToAsync(pendingDestination,
+        pendingCancellation.Token);
+    if (pendingCopy.IsCompleted) return 6;
+    pendingCancellation.Cancel();
+    if (!Finish(pendingCopy) || !IsCanceled(pendingCopy)) return 7;
+
+    CancellationTokenSource lateReadCancellation =
+        new CancellationTokenSource();
+    LateDataReadStream lateDataSource = new LateDataReadStream();
+    CountingWriteStream lateDataDestination = new CountingWriteStream();
+    Task lateDataCopy = lateDataSource.CopyToAsync(lateDataDestination,
+        lateReadCancellation.Token);
+    if (lateDataCopy.IsCompleted || lateDataSource.ReadCalls != 1u ||
+        lateDataDestination.WriteCalls != 0u) return 47;
+    lateReadCancellation.Cancel();
+    lateDataSource.CompleteWithByte(0x73u);
+    if (!Finish(lateDataCopy) || !IsCanceled(lateDataCopy) ||
+        lateDataSource.ReadCalls != 1u ||
+        lateDataDestination.WriteCalls != 0u) return 48;
+
+    CancellationTokenSource writeCancellation = new CancellationTokenSource();
+    OneByteReadStream writePendingSource = new OneByteReadStream();
+    StreamContent writePendingContent = new StreamContent(
+        writePendingSource, 16u, true);
+    PendingWriteStream writePendingDestination = new PendingWriteStream();
+    Task writePendingCopy = writePendingContent.CopyToAsync(
+        writePendingDestination, writeCancellation.Token);
+    if (!WaitForPendingWrite(writePendingDestination) ||
+        writePendingCopy.IsCompleted || writePendingSource.ReadCalls != 1u ||
+        writePendingDestination.WriteCalls != 1u) return 23;
+    writeCancellation.Cancel();
+    if (writePendingCopy.IsCompleted) return 24;
+    writePendingDestination.CompleteWrite();
+    if (!Finish(writePendingCopy) || !IsCanceled(writePendingCopy) ||
+        writePendingSource.ReadCalls != 1u ||
+        writePendingDestination.WriteCalls != 1u) return 25;
+    writePendingContent.Dispose();
+
+    CancellationTokenSource overlappingWriteCancellation =
+        new CancellationTokenSource();
+    DisposeAwareOneByteReadStream overlappingWriteSource =
+        new DisposeAwareOneByteReadStream();
+    StreamContent overlappingWriteContent = new StreamContent(
+        overlappingWriteSource, 16u, false);
+    PendingWriteStream overlappingWriteDestination = new PendingWriteStream();
+    Task overlappingWriteCopy = overlappingWriteContent.CopyToAsync(
+        overlappingWriteDestination, overlappingWriteCancellation.Token);
+    if (!WaitForPendingWrite(overlappingWriteDestination) ||
+        overlappingWriteCopy.IsCompleted ||
+        overlappingWriteSource.ReadCalls != 1u ||
+        overlappingWriteDestination.WriteCalls != 1u) return 41;
+    overlappingWriteContent.Dispose();
+    overlappingWriteCancellation.Cancel();
+    if (overlappingWriteCopy.IsCompleted ||
+        overlappingWriteSource.DisposeCount != 1u) return 42;
+    overlappingWriteDestination.CompleteWrite();
+    if (!Finish(overlappingWriteCopy) || !IsCanceled(overlappingWriteCopy) ||
+        overlappingWriteSource.ReadCalls != 1u ||
+        overlappingWriteDestination.WriteCalls != 1u ||
+        overlappingWriteSource.DisposeCount != 1u) return 43;
+
+    DisposeAwareOneByteReadStream disposedDuringWriteSource =
+        new DisposeAwareOneByteReadStream();
+    StreamContent disposedDuringWriteContent = new StreamContent(
+        disposedDuringWriteSource, 16u, false);
+    PendingWriteStream disposedDuringWriteDestination = new PendingWriteStream();
+    Task disposedDuringWriteCopy = disposedDuringWriteContent.CopyToAsync(
+        disposedDuringWriteDestination, CancellationToken.None);
+    if (!WaitForPendingWrite(disposedDuringWriteDestination) ||
+        disposedDuringWriteCopy.IsCompleted ||
+        disposedDuringWriteSource.ReadCalls != 1u ||
+        disposedDuringWriteDestination.WriteCalls != 1u) return 30;
+    disposedDuringWriteContent.Dispose();
+    if (disposedDuringWriteSource.DisposeCount != 1u ||
+        disposedDuringWriteCopy.IsCompleted) return 31;
+    disposedDuringWriteDestination.CompleteWrite();
+    if (!Finish(disposedDuringWriteCopy) ||
+        !disposedDuringWriteCopy.IsFaulted ||
+        disposedDuringWriteCopy.IsCanceled ||
+        disposedDuringWriteSource.ReadCalls != 2u ||
+        disposedDuringWriteDestination.WriteCalls != 1u) return 32;
+    bool disposeDuringWriteFaultObserved = false;
+    try {
+        disposedDuringWriteCopy.GetResult();
+    } catch (ObjectDisposedException) {
+        disposeDuringWriteFaultObserved = true;
+    }
+    if (!disposeDuringWriteFaultObserved ||
+        disposedDuringWriteSource.DisposeCount != 1u) return 33;
+
+    for (uint round = 0u; round < 24u; round += 1u) {
+        CancellationTokenSource completionDisposeCancellation =
+            new CancellationTokenSource();
+        DisposeAwareOneByteReadStream completionDisposeSource =
+            new DisposeAwareOneByteReadStream();
+        StreamContent completionDisposeContent = new StreamContent(
+            completionDisposeSource, 16u, false);
+        PendingWriteStream completionDisposeDestination =
+            new PendingWriteStream();
+        Task completionDisposeCopy = completionDisposeContent.CopyToAsync(
+            completionDisposeDestination,
+            completionDisposeCancellation.Token);
+        if (!WaitForPendingWrite(completionDisposeDestination) ||
+            completionDisposeCopy.IsCompleted ||
+            completionDisposeSource.ReadCalls != 1u ||
+            completionDisposeDestination.WriteCalls != 1u) return 49;
+        StreamCopyWriteDisposeRace completionDisposeRace =
+            new StreamCopyWriteDisposeRace(completionDisposeContent,
+                completionDisposeCancellation);
+        Thread contentDisposer = Thread.Start(
+            () => completionDisposeRace.DisposeAndCancel());
+        completionDisposeRace.Start.Exchange(1);
+        completionDisposeDestination.CompleteWrite();
+        contentDisposer.Join();
+        if (completionDisposeRace.DisposeFailed.Value != 0) {
+            Console.WriteLine("Dispose/cancel worker failed");
+            return 50;
+        }
+        if (completionDisposeSource.DisposeCount != 1u) {
+            Console.WriteLine("Disposed source was not disposed exactly once");
+            return 50;
+        }
+        if (!Finish(completionDisposeCopy)) {
+            Console.WriteLine("Copy did not complete after write/dispose race");
+            return 50;
+        }
+        if (completionDisposeCopy.IsCanceled) {
+            if (completionDisposeSource.ReadCalls != 1u) {
+                Console.WriteLine(
+                    "Copy started another source read after cancellation");
+                return 50;
+            }
+        } else if (completionDisposeCopy.IsFaulted) {
+            bool disposedFault = false;
+            try {
+                completionDisposeCopy.GetResult();
+            } catch (ObjectDisposedException) {
+                disposedFault = true;
+            } catch (Exception) { }
+            if (!disposedFault || completionDisposeSource.ReadCalls != 2u) {
+                Console.WriteLine(
+                    "Copy produced an invalid fault in write/dispose race");
+                return 50;
+            }
+        } else if (completionDisposeSource.ReadCalls != 2u) {
+            Console.WriteLine("Copy completed with an invalid read count");
+            return 50;
+        }
+        if (completionDisposeDestination.WriteCalls != 1u) {
+            Console.WriteLine("Copy started another destination write");
+            return 50;
+        }
+    }
+
+    byte[] disposeRaceBytes = new byte[4194304u];
+    for (uint index = 0u; index < disposeRaceBytes.Length; index += 1u) {
+        disposeRaceBytes[index] = (byte)(index * 29u + 11u);
+    }
+    for (uint round = 0u; round < 12u; round += 1u) {
+        TrackedMemoryStream disposeRaceSource = new TrackedMemoryStream();
+        disposeRaceSource.Write(disposeRaceBytes, 0u, disposeRaceBytes.Length);
+        disposeRaceSource.Position = 0L;
+        StreamContent disposeRaceContent = new StreamContent(
+            disposeRaceSource, disposeRaceBytes.Length, false);
+        StreamContentReadDisposeRace disposeRace =
+            new StreamContentReadDisposeRace(
+                disposeRaceContent, disposeRaceBytes);
+        Thread reader = Thread.Start(() => disposeRace.Read());
+        disposeRace.Start.Exchange(1);
+        uint startSteps = 0u;
+        while (disposeRace.ReadStarted.Value == 0 && startSteps < 100000u) {
+            Thread.Yield();
+            startSteps += 1u;
+        }
+        disposeRaceContent.Dispose();
+        reader.Join();
+        if (startSteps == 100000u ||
+            (disposeRace.Outcome.Value != 1 && disposeRace.Outcome.Value != 3) ||
+            disposeRaceSource.DisposeCount.Value != 1) return 28;
+    }
+    return 0;
+}

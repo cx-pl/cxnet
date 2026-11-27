@@ -1,0 +1,166 @@
+import System;
+import System.Collections;
+import System.Threading;
+
+namespace System.Net.Http;
+
+public struct HttpHeader {
+    public string Name;
+    public string Value;
+
+    public constructor(string name, string value) {
+        Name = name;
+        Value = value;
+    }
+}
+
+// Ordered header collection. Names are compared case-insensitively when read;
+// duplicate values are preserved as separate fields.
+public final class HttpHeaders : Object {
+    private List<HttpHeader> _items;
+    private Mutex _mutex;
+
+    public uint Count {
+        const get {
+            _mutex.Lock();
+            try { return _items.Count; }
+            finally { _mutex.Unlock(); }
+        }
+    }
+
+    public constructor() {
+        _items = new List<HttpHeader>();
+        _mutex = new Mutex();
+    }
+
+    public void Add(string name, string value) {
+        ValidateName(name);
+        ValidateValue(value);
+        _mutex.Lock();
+        try { _items.Add(new HttpHeader(name, value)); }
+        finally { _mutex.Unlock(); }
+    }
+
+    public bool TryAddWithoutValidation(string name, string value) {
+        if (name == null || value == null || !IsValidName(name) || !IsValidValue(value)) {
+            return false;
+        }
+        _mutex.Lock();
+        try { _items.Add(new HttpHeader(name, value)); }
+        finally { _mutex.Unlock(); }
+        return true;
+    }
+
+    public bool Contains(string name) {
+        if (name == null) return false;
+        _mutex.Lock();
+        try {
+            for (uint index = 0u; index < _items.Count; index += 1u) {
+                if (EqualsIgnoreCase(_items.Get(index).Name, name)) return true;
+            }
+            return false;
+        } finally {
+            _mutex.Unlock();
+        }
+    }
+
+    public bool Remove(string name) {
+        if (name == null) return false;
+        bool removed = false;
+        _mutex.Lock();
+        try {
+            uint index = 0u;
+            while (index < _items.Count) {
+                if (EqualsIgnoreCase(_items.Get(index).Name, name)) {
+                    _items.RemoveAt(index);
+                    removed = true;
+                } else {
+                    index += 1u;
+                }
+            }
+            return removed;
+        } finally {
+            _mutex.Unlock();
+        }
+    }
+
+    public string GetFirstValue(string name) {
+        if (name == null) return null;
+        _mutex.Lock();
+        try {
+            for (uint index = 0u; index < _items.Count; index += 1u) {
+                HttpHeader item = _items.Get(index);
+                if (EqualsIgnoreCase(item.Name, name)) return item.Value;
+            }
+            return null;
+        } finally {
+            _mutex.Unlock();
+        }
+    }
+
+    public HttpHeader Get(uint index) {
+        _mutex.Lock();
+        try { return _items.Get(index); }
+        finally { _mutex.Unlock(); }
+    }
+
+    internal HttpHeaders Snapshot() {
+        HttpHeaders snapshot = new HttpHeaders();
+        _mutex.Lock();
+        try {
+            for (uint index = 0u; index < _items.Count; index += 1u) {
+                snapshot.Add(_items.Get(index).Name, _items.Get(index).Value);
+            }
+        } finally {
+            _mutex.Unlock();
+        }
+        return snapshot;
+    }
+
+    private static void ValidateName(string name) {
+        if (name == null) throw new System.ArgumentNullException("name");
+        if (!IsValidName(name)) throw new System.ArgumentException("Invalid HTTP header name.", "name");
+    }
+
+    private static void ValidateValue(string value) {
+        if (value == null) throw new System.ArgumentNullException("value");
+        if (!IsValidValue(value)) throw new System.ArgumentException("HTTP header values cannot contain line breaks or control characters.", "value");
+    }
+
+    private static bool IsValidName(string name) {
+        if (name.Length == 0u) return false;
+        for (uint index = 0u; index < name.Length; index += 1u) {
+            char value = name.Item[index];
+            if (!((value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+                (value >= '0' && value <= '9') || value == '!' || value == '#' ||
+                value == '$' || value == '%' || value == '&' || value == '\'' ||
+                value == '*' || value == '+' || value == '-' || value == '.' ||
+                value == '^' || value == '_' || value == '`' || value == '|' || value == '~')) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool IsValidValue(string value) {
+        for (uint index = 0u; index < value.Length; index += 1u) {
+            char current = value.Item[index];
+            if (current == '\r' || current == '\n' || (current < ' ' && current != '\t') || current == 0x7Fu) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool EqualsIgnoreCase(string left, string right) {
+        if (left.Length != right.Length) return false;
+        for (uint index = 0u; index < left.Length; index += 1u) {
+            char a = left.Item[index];
+            char b = right.Item[index];
+            if (a >= 'A' && a <= 'Z') a = (char)((uint)a + 32u);
+            if (b >= 'A' && b <= 'Z') b = (char)((uint)b + 32u);
+            if (a != b) return false;
+        }
+        return true;
+    }
+}

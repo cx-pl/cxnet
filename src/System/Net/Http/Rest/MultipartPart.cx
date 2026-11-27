@@ -1,0 +1,9 @@
+import System;
+
+namespace System.Net.Http.Rest;
+
+@AnnotationUsage(targets = "parameter")
+public final class MultipartPart : Annotation {
+    public constructor(string name) {}
+    public constructor(string name, string fileName) {}
+}

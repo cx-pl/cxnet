@@ -1,0 +1,1560 @@
+import System;
+import System.Collections;
+import System.IO;
+import System.Threading;
+import System.Threading.Tasks;
+import System.Net;
+
+namespace System.Net.Sockets;
+// Wraps an already-connected native stream socket and takes ownership of it.
+public final class Socket : IDisposable {
+    private Mutex _lifecycleMutex;
+    private ulong _nativeHandle;
+    private bool _disposed;
+    private uint _state;
+    private bool _receiveActive;
+    private bool _sendActive;
+    private bool _receiveSequenceActive;
+    private Task<uint> _receiveTask;
+    private Task<uint> _sendTask;
+    private uint _receiveGeneration;
+    private AddressFamily _addressFamily;
+    private bool _dualMode;
+    private bool _noDelay;
+    private bool _keepAlive;
+    private bool _reuseAddress;
+    private int _receiveBufferSize;
+    private int _sendBufferSize;
+    private bool _hasReceiveBufferSize;
+    private bool _hasSendBufferSize;
+    private uint _connectTimeoutMilliseconds;
+    private TaskCompletionSource _hostConnectCompletion;
+    private CancellationTokenSource _hostConnectCancellation;
+    private AtomicInt _hostConnectFinalized;
+    private CancellationTokenRegistration _hostConnectCallerRegistration;
+    private ulong _hostConnectTimer;
+
+    // Covers DNS resolution and all resolved-address attempts for async host connects.
+    public uint ConnectTimeoutMilliseconds {
+        get {
+            _lifecycleMutex.Lock();
+            try {
+                EnsureNotDisposed();
+                return _connectTimeoutMilliseconds;
+            } finally {
+                _lifecycleMutex.Unlock();
+            }
+        }
+        set {
+            _lifecycleMutex.Lock();
+            try {
+                EnsureNotDisposed();
+                _connectTimeoutMilliseconds = value;
+            } finally {
+                _lifecycleMutex.Unlock();
+            }
+        }
+    }
+
+    public bool Connected {
+        const get {
+            _lifecycleMutex.Lock();
+            try { return !_disposed && (_state == 3u || _state == 4u); }
+            finally { _lifecycleMutex.Unlock(); }
+        }
+    }
+    public bool IsBound {
+        const get {
+            _lifecycleMutex.Lock();
+            try {
+                return !_disposed && (_state == 1u || _state == 2u ||
+                    _state == 3u || _state == 4u);
+            } finally { _lifecycleMutex.Unlock(); }
+        }
+    }
+    public bool IsListening {
+        const get {
+            _lifecycleMutex.Lock();
+            try { return !_disposed && _state == 2u; }
+            finally { _lifecycleMutex.Unlock(); }
+        }
+    }
+    public AddressFamily AddressFamily { const get { return _addressFamily; } }
+    public IPEndPoint? LocalEndPoint {
+        get { return GetSocketEndPoint(false); }
+    }
+    public IPEndPoint? RemoteEndPoint {
+        get { return GetSocketEndPoint(true); }
+    }
+
+    public IPEndPoint GetLocalEndPoint() {
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (_state == 0u) throw new InvalidOperationException(
+                "The socket has no local endpoint.");
+            return QuerySocketEndPoint(false);
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    public bool NoDelay {
+        get { return GetBooleanOption(1); }
+        set { SetBooleanOption(1, value); }
+    }
+
+    public bool KeepAlive {
+        get { return GetBooleanOption(2); }
+        set { SetBooleanOption(2, value); }
+    }
+
+    public bool ReuseAddress {
+        get { return GetBooleanOption(6); }
+        set { SetBooleanOption(6, value); }
+    }
+
+    public int ReceiveBufferSize {
+        get { return GetIntegerOption(3); }
+        set { SetIntegerOption(3, value); }
+    }
+
+    public int SendBufferSize {
+        get { return GetIntegerOption(4); }
+        set { SetIntegerOption(4, value); }
+    }
+
+    public bool DualMode {
+        get {
+            _lifecycleMutex.Lock();
+            try {
+                EnsureNotDisposed();
+                return _dualMode;
+            } finally {
+                _lifecycleMutex.Unlock();
+            }
+        }
+        set { SetDualMode(value); }
+    }
+
+    public Task<uint> ReadAsync(
+        byte[] buffer, uint offset, uint count) {
+        return ReadAsync(buffer, offset, count, CancellationToken.None);
+    }
+
+    public void Bind(EndPoint localEndPoint) {
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (_state != 0u) throw new InvalidOperationException(
+                "The socket is already bound or in use.");
+            if (localEndPoint == null)
+                throw new ArgumentNullException("localEndPoint");
+            if (!(localEndPoint is IPEndPoint)) {
+                throw new ArgumentException(
+                    "Only IP endpoints are supported.", "localEndPoint");
+            }
+            IPEndPoint endpoint = (IPEndPoint)localEndPoint;
+            if (endpoint.AddressFamily != _addressFamily) {
+                if (!(_addressFamily == AddressFamily.InterNetworkV6 &&
+                    _dualMode && endpoint.AddressFamily ==
+                        AddressFamily.InterNetwork)) {
+                    throw new ArgumentException(
+                        "The endpoint family does not match the socket.",
+                        "localEndPoint");
+                }
+            }
+            IPAddress address = endpoint.Address;
+            int errorCode = SocketRuntime.Bind(_nativeHandle,
+                GetNativeAddressFamily(address.AddressFamily),
+                GetAddressWord0(address), GetAddressWord1(address),
+                GetAddressWord2(address), GetAddressWord3(address),
+                address.ScopeId, endpoint.Port);
+            ThrowIfSocketError("Could not bind the socket.", errorCode);
+            _state = 1u;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    public void Listen() { Listen(0); }
+
+    public void Listen(int backlog) {
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (_state != 0u && _state != 1u) {
+                throw new InvalidOperationException(
+                    "The socket cannot listen in its current state.");
+            }
+            if (backlog < 0) throw new ArgumentOutOfRangeException("backlog");
+            int errorCode = SocketRuntime.Listen(_nativeHandle, backlog);
+            ThrowIfSocketError("Could not listen on the socket.", errorCode);
+            _state = 2u;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    public void Shutdown(SocketShutdown how) {
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (_state != 3u && _state != 4u) {
+                throw new InvalidOperationException(
+                    "Only a connected socket can be shut down.");
+            }
+            int shutdownCode;
+            if (how == SocketShutdown.Receive) shutdownCode = 0;
+            else if (how == SocketShutdown.Send) shutdownCode = 1;
+            else if (how == SocketShutdown.Both) shutdownCode = 2;
+            else throw new ArgumentOutOfRangeException("how");
+            int errorCode = SocketRuntime.Shutdown(_nativeHandle, shutdownCode);
+            ThrowIfSocketError("Could not shut down the socket.", errorCode);
+            _state = 4u;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    public void Connect(EndPoint remoteEndPoint) {
+        IPEndPoint endpoint = null;
+        IPAddress address = null;
+        ulong nativeHandle = ULong.MaxValue;
+        _lifecycleMutex.Lock();
+        try {
+            EnsureConnectable(remoteEndPoint);
+            endpoint = (IPEndPoint)remoteEndPoint;
+            address = endpoint.Address;
+            nativeHandle = _nativeHandle;
+            _state = 6u;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        int errorCode = SocketRuntime.ConnectBlocking(nativeHandle,
+            GetNativeAddressFamily(address.AddressFamily),
+            GetAddressWord0(address), GetAddressWord1(address),
+            GetAddressWord2(address), GetAddressWord3(address),
+            address.ScopeId, endpoint.Port);
+        if (errorCode != 0) {
+            ResetAfterConnectFailure();
+            ThrowIfSocketError("Could not connect the socket.", errorCode);
+        }
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            _state = 3u;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    public void Connect(DnsEndPoint remoteEndPoint) {
+        if (remoteEndPoint == null) throw new ArgumentNullException("remoteEndPoint");
+        Connect(remoteEndPoint.Host, remoteEndPoint.Port);
+    }
+
+    public Task ConnectAsync(DnsEndPoint remoteEndPoint) {
+        return ConnectAsync(remoteEndPoint, CancellationToken.None);
+    }
+
+    public Task ConnectAsync(DnsEndPoint remoteEndPoint,
+        CancellationToken cancellationToken) {
+        if (remoteEndPoint == null) throw new ArgumentNullException("remoteEndPoint");
+        return ConnectAsync(remoteEndPoint.Host, remoteEndPoint.Port, cancellationToken);
+    }
+
+    public Task ConnectAsync(string host, int port) {
+        return ConnectAsync(host, port, CancellationToken.None);
+    }
+
+    public Task ConnectAsync(string host, int port,
+        CancellationToken cancellationToken) {
+        if (host == null) throw new ArgumentNullException("host");
+        if (port < 0 || port > 65535) throw new ArgumentOutOfRangeException("port");
+        TaskCompletionSource completion = new TaskCompletionSource();
+        CancellationTokenSource hostCancellation = null;
+        uint connectTimeoutMilliseconds = 0u;
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (_state != 0u || _hostConnectCompletion != null)
+                throw new InvalidOperationException(
+                "The socket is already bound or in use.");
+            if (cancellationToken.IsCancellationRequested) {
+                completion.SetCanceled();
+                return completion.Task;
+            }
+            hostCancellation = new CancellationTokenSource();
+            _hostConnectCompletion = completion;
+            _hostConnectCancellation = hostCancellation;
+            _hostConnectFinalized = new AtomicInt(0);
+            connectTimeoutMilliseconds = _connectTimeoutMilliseconds;
+            _state = 6u;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        Socket socket = this;
+        Task<IPAddress[]> resolveTask;
+        try {
+            ulong hostTimer = 0u;
+            if (connectTimeoutMilliseconds != 0u) {
+                hostTimer = SocketRuntime.ScheduleTimer(
+                    connectTimeoutMilliseconds,
+                    () => socket.TimeoutHostConnect(completion));
+                bool timerRegistered = false;
+                _lifecycleMutex.Lock();
+                try {
+                    if (_hostConnectCompletion == completion &&
+                        !completion.Task.IsCompleted) {
+                        _hostConnectTimer = hostTimer;
+                        timerRegistered = true;
+                    }
+                } finally {
+                    _lifecycleMutex.Unlock();
+                }
+                if (!timerRegistered) {
+                    SocketRuntime.CancelTimer(hostTimer);
+                    return completion.Task;
+                }
+                if (completion.Task.IsCompleted) return completion.Task;
+            }
+            CancellationTokenRegistration callerRegistration =
+                cancellationToken.Register(() => socket.CancelHostConnect(
+                    completion, hostCancellation));
+            bool registrationStored = false;
+            _lifecycleMutex.Lock();
+            try {
+                if (_hostConnectCompletion == completion &&
+                    !completion.Task.IsCompleted) {
+                    _hostConnectCallerRegistration = callerRegistration;
+                    registrationStored = true;
+                }
+            } finally {
+                _lifecycleMutex.Unlock();
+            }
+            if (!registrationStored) {
+                callerRegistration.Dispose();
+                return completion.Task;
+            }
+            if (completion.Task.IsCompleted) return completion.Task;
+            cancellationToken.ThrowIfCancellationRequested();
+            resolveTask = Dns.GetHostAddressesAsync(host);
+            resolveTask.OnCompleted(() => {
+                if (completion.Task.IsCompleted) return;
+                try {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    IPAddress[] addresses = resolveTask.GetResult();
+                    socket.ConnectAddressListAsync(addresses, 0u, port,
+                        hostCancellation.Token, completion, 0, false);
+                } catch (OperationCanceledException) {
+                    socket.FinishHostConnectCanceled(completion);
+                } catch (Exception error) {
+                    socket.FinishHostConnectError(completion, error);
+                }
+            });
+        } catch (OperationCanceledException) {
+            FinishHostConnectCanceled(completion);
+            return completion.Task;
+        } catch (Exception error) {
+            FinishHostConnectError(completion, error);
+            return completion.Task;
+        }
+        return completion.Task;
+    }
+
+    private void CancelHostConnect(TaskCompletionSource completion,
+        CancellationTokenSource cancellation) {
+        try {
+            cancellation.Cancel();
+        } finally {
+            FinishHostConnectCanceled(completion);
+        }
+    }
+
+    private void TimeoutHostConnect(TaskCompletionSource completion) {
+        CancellationTokenSource cancellation = null;
+        _lifecycleMutex.Lock();
+        try {
+            if (_hostConnectCompletion != completion ||
+                completion.Task.IsCompleted) return;
+            cancellation = _hostConnectCancellation;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        if (cancellation != null && cancellation.IsCancellationRequested) {
+            FinishHostConnectCanceled(completion);
+            return;
+        }
+        FinishHostConnectError(completion,
+            new TimeoutException("The hostname connection timed out."));
+        if (cancellation != null) cancellation.Cancel();
+    }
+
+    private void FinishHostConnectCanceled(TaskCompletionSource completion) {
+        if (completion.Task.IsCompleted || !TryFinalizeHostConnect(completion)) return;
+        Exception resetError = null;
+        try {
+            ResetAfterConnectFailure();
+        } catch (Exception error) {
+            resetError = error;
+        }
+        Exception cleanupError = null;
+        try {
+            CleanupHostConnect(completion);
+        } catch (Exception error) {
+            cleanupError = error;
+        }
+        if (resetError != null) completion.SetException(resetError);
+        else if (cleanupError != null) completion.SetException(cleanupError);
+        else completion.SetCanceled();
+    }
+
+    private void FinishHostConnectError(TaskCompletionSource completion, Exception error) {
+        if (completion.Task.IsCompleted || !TryFinalizeHostConnect(completion)) return;
+        Exception resetError = null;
+        try {
+            ResetAfterConnectFailure();
+        } catch (Exception resetFailure) {
+            resetError = resetFailure;
+        }
+        Exception cleanupError = null;
+        try {
+            CleanupHostConnect(completion);
+        } catch (Exception cleanupFailure) {
+            cleanupError = cleanupFailure;
+        }
+        completion.SetException(resetError ?? cleanupError ?? error);
+    }
+
+    private void FinishHostConnectSuccess(TaskCompletionSource completion) {
+        if (completion.Task.IsCompleted) return;
+        _lifecycleMutex.Lock();
+        try {
+            if (_disposed || !TryFinalizeHostConnect(completion)) return;
+            _state = 3u;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        Exception completionError = null;
+        try {
+            completion.SetResult();
+        } catch (Exception error) {
+            completionError = error;
+        }
+        try {
+            CleanupHostConnect(completion);
+        } catch (Exception cleanupError) {
+            if (completionError == null) completionError = cleanupError;
+        }
+        if (completionError != null) throw completionError;
+    }
+
+    private bool TryFinalizeHostConnect(TaskCompletionSource completion) {
+        _lifecycleMutex.Lock();
+        try {
+            if (_hostConnectCompletion != completion) return false;
+            return _hostConnectFinalized.CompareExchange(1, 0) == 0;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    private void CleanupHostConnect(TaskCompletionSource completion) {
+        ulong timer = 0u;
+        CancellationTokenRegistration callerRegistration =
+            CancellationTokenRegistration.None;
+        _lifecycleMutex.Lock();
+        try {
+            if (_hostConnectCompletion != completion) return;
+            timer = _hostConnectTimer;
+            callerRegistration = _hostConnectCallerRegistration;
+            _hostConnectTimer = 0u;
+            _hostConnectCallerRegistration = CancellationTokenRegistration.None;
+            _hostConnectCompletion = null;
+            _hostConnectCancellation = null;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        Exception cleanupError = null;
+        if (timer != 0u) {
+            try {
+                SocketRuntime.CancelTimer(timer);
+            } catch (Exception error) {
+                cleanupError = error;
+            }
+        }
+        try {
+            callerRegistration.Dispose();
+        } catch (Exception error) {
+            if (cleanupError == null) cleanupError = error;
+        }
+        if (cleanupError != null) throw cleanupError;
+    }
+
+    private void FinishCrossThreadDispose(
+        TaskCompletionSource completion,
+        CancellationTokenSource cancellation,
+        Exception closeError) {
+        Exception cleanupError = closeError;
+        try {
+            CleanupHostConnect(completion);
+        } catch (Exception error) {
+            if (cleanupError == null) cleanupError = error;
+        }
+        try {
+            completion.SetException(new ObjectDisposedException("Socket"));
+        } catch (Exception error) {
+            if (cleanupError == null) cleanupError = error;
+        }
+        try {
+            cancellation.Cancel();
+        } catch (Exception error) {
+            if (cleanupError == null) cleanupError = error;
+        }
+        if (cleanupError != null) throw cleanupError;
+    }
+
+    private void ConnectAddressListAsync(IPAddress[] addresses, uint index,
+        int port, CancellationToken cancellationToken,
+        TaskCompletionSource completion, int lastErrorCode, bool matchedFamily) {
+        EnsureNotDisposed();
+        if (completion.Task.IsCompleted) return;
+        if (index >= addresses.Length) {
+            if (lastErrorCode != 0) {
+                FinishHostConnectError(completion, new SocketException(
+                    "Could not connect the socket.",
+                    SocketRuntime.GetNativeErrorDomainName(), lastErrorCode));
+                return;
+            }
+            if (!matchedFamily) {
+                FinishHostConnectError(completion, new SocketException(
+                    "No resolved address matches the socket family.", "dns", 0));
+                return;
+            }
+            FinishHostConnectError(completion, new SocketException(
+                "Host name resolution returned no usable address.", "dns", 0));
+            return;
+        }
+        IPAddress address = addresses[index];
+        if (address.AddressFamily != _addressFamily &&
+            !(_addressFamily == AddressFamily.InterNetworkV6 && _dualMode &&
+                address.AddressFamily == AddressFamily.InterNetwork)) {
+            ConnectAddressListAsync(addresses, index + 1u, port,
+                cancellationToken, completion, lastErrorCode, matchedFamily);
+            return;
+        }
+        int result = 0;
+        Task<uint> waitTask = null;
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (completion.Task.IsCompleted) return;
+            cancellationToken.ThrowIfCancellationRequested();
+            _state = 6u;
+            result = SocketRuntime.ConnectStart(_nativeHandle,
+                GetNativeAddressFamily(address.AddressFamily),
+                GetAddressWord0(address), GetAddressWord1(address),
+                GetAddressWord2(address), GetAddressWord3(address),
+                address.ScopeId, (uint)port);
+            if (result > 0) {
+                waitTask = SocketRuntime.WaitAsync(_nativeHandle,
+                    cancellationToken, true);
+            }
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        if (result == 0) {
+            FinishHostConnectSuccess(completion);
+            return;
+        }
+        if (result < 0) {
+            int errorCode = -result;
+            ResetAfterConnectFailure();
+            ConnectAddressListAsync(addresses, index + 1u, port,
+                cancellationToken, completion, errorCode, true);
+            return;
+        }
+        Socket socket = this;
+        waitTask.OnCompleted(() => {
+            if (completion.Task.IsCompleted) return;
+            try {
+                uint waitResult = waitTask.GetResult();
+                cancellationToken.ThrowIfCancellationRequested();
+                if (waitResult == 2u) {
+                    throw new ObjectDisposedException("Socket");
+                }
+                    int finishError;
+                    socket._lifecycleMutex.Lock();
+                    try {
+                        if (socket._disposed)
+                            throw new ObjectDisposedException("Socket");
+                        finishError = SocketRuntime.FinishConnect(
+                            socket._nativeHandle);
+                    } finally {
+                        socket._lifecycleMutex.Unlock();
+                    }
+                if (finishError != 0) {
+                    socket.ResetAfterConnectFailure();
+                    socket.ConnectAddressListAsync(addresses, index + 1u, port,
+                        cancellationToken, completion, finishError, true);
+                    return;
+                }
+                socket.FinishHostConnectSuccess(completion);
+            } catch (OperationCanceledException) {
+                socket.FinishHostConnectCanceled(completion);
+            } catch (Exception error) {
+                socket.FinishHostConnectError(completion, error);
+            }
+        });
+    }
+
+    public void Connect(string host, int port) {
+        if (host == null) throw new ArgumentNullException("host");
+        if (port < 0 || port > 65535) throw new ArgumentOutOfRangeException("port");
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (_state != 0u || _hostConnectCompletion != null) {
+                throw new InvalidOperationException(
+                    "The socket is already bound or in use.");
+            }
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        IPAddress[] addresses = Dns.GetHostAddresses(host);
+        SocketException lastError = null;
+        for (uint index = 0u; index < addresses.Length; index += 1u) {
+            IPAddress address = addresses[index];
+            if (address.AddressFamily != _addressFamily &&
+                !(_addressFamily == AddressFamily.InterNetworkV6 && _dualMode &&
+                    address.AddressFamily == AddressFamily.InterNetwork)) {
+                continue;
+            }
+            try {
+                Connect(new IPEndPoint(address, port));
+                return;
+            } catch (SocketException error) {
+                lastError = error;
+            }
+        }
+        if (lastError != null) throw lastError;
+        throw new SocketException("No resolved address matches the socket family.", "dns", 0);
+    }
+
+    public Task ConnectAsync(EndPoint remoteEndPoint) {
+        return ConnectAsync(remoteEndPoint, CancellationToken.None);
+    }
+
+    public Task ConnectAsync(
+        EndPoint remoteEndPoint, CancellationToken cancellationToken) {
+        TaskCompletionSource completion = new TaskCompletionSource();
+        Task<uint> waitTask = null;
+        Exception setupError = null;
+        bool setupCanceled = false;
+        bool connectStarted = false;
+        int startResult = 0;
+        IPEndPoint endpoint = null;
+        IPAddress address = null;
+        _lifecycleMutex.Lock();
+        try {
+            EnsureConnectable(remoteEndPoint);
+            cancellationToken.ThrowIfCancellationRequested();
+            endpoint = (IPEndPoint)remoteEndPoint;
+            address = endpoint.Address;
+            _state = 6u;
+            connectStarted = true;
+            startResult = SocketRuntime.ConnectStart(_nativeHandle,
+                GetNativeAddressFamily(address.AddressFamily),
+                GetAddressWord0(address), GetAddressWord1(address),
+                GetAddressWord2(address), GetAddressWord3(address),
+                address.ScopeId, endpoint.Port);
+            if (startResult == 0) {
+                _state = 3u;
+            } else if (startResult > 0) {
+                waitTask = SocketRuntime.WaitAsync(_nativeHandle,
+                    cancellationToken, true);
+            }
+        } catch (OperationCanceledException) {
+            setupCanceled = true;
+        } catch (Exception error) {
+            setupError = error;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        if (setupCanceled) {
+            if (connectStarted) {
+                try {
+                    ResetAfterConnectFailure();
+                } catch (Exception resetError) {
+                    completion.SetException(resetError);
+                    return completion.Task;
+                }
+            }
+            completion.SetCanceled();
+            return completion.Task;
+        }
+        if (setupError != null) {
+            if (connectStarted) {
+                try {
+                    ResetAfterConnectFailure();
+                } catch (Exception resetError) {
+                    setupError = resetError;
+                }
+            }
+            completion.SetException(setupError);
+            return completion.Task;
+        }
+        if (startResult == 0) {
+            completion.SetResult();
+            return completion.Task;
+        }
+        if (startResult < 0) {
+            int errorCode = -startResult;
+            try {
+                ResetAfterConnectFailure();
+                ThrowIfSocketError("Could not connect the socket.", errorCode);
+            } catch (Exception error) {
+                completion.SetException(error);
+            }
+            return completion.Task;
+        }
+        Socket socket = this;
+        try {
+            waitTask.OnCompleted(() => {
+                try {
+                    uint waitResult = waitTask.GetResult();
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (waitResult == 2u) {
+                        throw new ObjectDisposedException("Socket");
+                    }
+                    int finishError;
+                    socket._lifecycleMutex.Lock();
+                    try {
+                        if (socket._disposed)
+                            throw new ObjectDisposedException("Socket");
+                        finishError = SocketRuntime.FinishConnect(
+                            socket._nativeHandle);
+                        if (finishError == 0) socket._state = 3u;
+                    } finally {
+                        socket._lifecycleMutex.Unlock();
+                    }
+                    if (finishError != 0) {
+                        socket.ResetAfterConnectFailure();
+                        Socket.ThrowIfSocketError(
+                            "Could not connect the socket.", finishError);
+                    }
+                    completion.SetResult();
+                } catch (OperationCanceledException) {
+                    try {
+                        socket.ResetAfterConnectFailure();
+                    } catch (OperationCanceledException) {
+                        completion.SetCanceled();
+                        return;
+                    } catch (Exception resetError) {
+                        completion.SetException(resetError);
+                        return;
+                    }
+                    completion.SetCanceled();
+                } catch (Exception error) {
+                    Exception completionError = error;
+                    try {
+                        socket.ResetAfterConnectFailure();
+                    } catch (Exception resetError) {
+                        completionError = resetError;
+                    }
+                    completion.SetException(completionError);
+                }
+            });
+        } catch (Exception error) {
+            try {
+                ResetAfterConnectFailure();
+            } catch (Exception resetError) {
+                error = resetError;
+            }
+            completion.SetException(error);
+        }
+        return completion.Task;
+    }
+
+    public Socket Accept() {
+        ulong listenerHandle = ULong.MaxValue;
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (_state != 2u) throw new InvalidOperationException(
+                "The socket is not listening.");
+            listenerHandle = _nativeHandle;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        ulong acceptedHandle = SocketRuntime.AcceptBlocking(listenerHandle);
+        if (acceptedHandle == ULong.MaxValue) {
+            ThrowIfSocketError("Could not accept a connection.",
+                SocketRuntime.GetLastAcceptError());
+        }
+        return new Socket(acceptedHandle, _addressFamily, true);
+    }
+
+    public Task<Socket> AcceptAsync() {
+        return AcceptAsync(CancellationToken.None);
+    }
+
+    public Task<Socket> AcceptAsync(CancellationToken cancellationToken) {
+        TaskCompletionSource<Socket> completion = new TaskCompletionSource<Socket>();
+        Socket listener = this;
+        AcceptAsyncAttempt(listener, cancellationToken, completion);
+        return completion.Task;
+    }
+
+    private static void AcceptAsyncAttempt(Socket listener,
+        CancellationToken cancellationToken,
+        TaskCompletionSource<Socket> completion) {
+        ulong acceptedHandle = ULong.MaxValue;
+        int errorCode = 0;
+        Task<uint> waitTask = null;
+        ulong listenerHandle = ULong.MaxValue;
+        try {
+            listener._lifecycleMutex.Lock();
+            try {
+                listener.EnsureNotDisposed();
+                if (listener._state != 2u) {
+                    throw new InvalidOperationException(
+                        "The socket is no longer listening.");
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+                listenerHandle = listener._nativeHandle;
+                acceptedHandle = SocketRuntime.Accept(listenerHandle);
+                if (acceptedHandle == ULong.MaxValue) {
+                    errorCode = SocketRuntime.GetLastAcceptError();
+                    if (errorCode == 1) {
+                        waitTask = SocketRuntime.WaitAsync(
+                            listenerHandle, cancellationToken, false);
+                    }
+                }
+            } finally {
+                listener._lifecycleMutex.Unlock();
+            }
+            if (acceptedHandle != ULong.MaxValue) {
+                try {
+                    cancellationToken.ThrowIfCancellationRequested();
+                } catch (OperationCanceledException) {
+                    ulong canceledHandle = acceptedHandle;
+                    acceptedHandle = ULong.MaxValue;
+                    CloseNativeHandle(canceledHandle);
+                    throw;
+                }
+                completion.SetResult(new Socket(acceptedHandle,
+                    listener._addressFamily, true));
+                acceptedHandle = ULong.MaxValue;
+                return;
+            }
+            if (errorCode != 1) {
+                ThrowIfSocketError("Could not accept a connection.", errorCode);
+                return;
+            }
+            waitTask.OnCompleted(() => {
+                try {
+                    uint waitResult = waitTask.GetResult();
+                    if (waitResult == 2u) {
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
+                    AcceptAsyncAttempt(listener, cancellationToken, completion);
+                } catch (OperationCanceledException) {
+                    completion.SetCanceled();
+                } catch (Exception error) {
+                    completion.SetException(error);
+                }
+            });
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception error) {
+            completion.SetException(error);
+        }
+    }
+
+    public Task<uint> ReceiveAsync(
+        byte[] buffer, uint offset, uint count,
+        CancellationToken cancellationToken) {
+        return ReadAsync(buffer, offset, count, cancellationToken);
+    }
+
+    public Task<uint> ReceiveAsync(byte[] buffer, uint offset, uint count) {
+        return ReadAsync(buffer, offset, count);
+    }
+
+    public int Receive(byte[] buffer, uint offset, uint count) {
+        ValidateBuffer(buffer, offset, count);
+        if (count > (uint)Int.MaxValue) throw new ArgumentOutOfRangeException("count");
+        ulong nativeHandle = ULong.MaxValue;
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            EnsureConnected();
+            nativeHandle = _nativeHandle;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        long received = SocketRuntime.TransferBlocking(
+            nativeHandle, buffer, offset, count, false);
+        if (received < 0) {
+            ThrowIfSocketError("Could not receive from the socket.", (int)-received);
+        }
+        return (int)received;
+    }
+
+    public int Send(byte[] buffer, uint offset, uint count) {
+        ValidateBuffer(buffer, offset, count);
+        if (count > (uint)Int.MaxValue) throw new ArgumentOutOfRangeException("count");
+        ulong nativeHandle = ULong.MaxValue;
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            EnsureConnected();
+            nativeHandle = _nativeHandle;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        long sent = SocketRuntime.TransferBlocking(
+            nativeHandle, buffer, offset, count, true);
+        if (sent < 0) {
+            ThrowIfSocketError("Could not send from the socket.", (int)-sent);
+        }
+        return (int)sent;
+    }
+
+    public Task<uint> SendAsync(
+        byte[] buffer, uint offset, uint count,
+        CancellationToken cancellationToken) {
+        return WriteAsync(buffer, offset, count, cancellationToken);
+    }
+
+    public Task<uint> SendAsync(byte[] buffer, uint offset, uint count) {
+        return WriteAsync(buffer, offset, count);
+    }
+
+    // Pulls one byte at a time from the connected stream. Each read is a single
+    // nonblocking transfer; a zero-byte read ends the sequence at EOF.
+    public async IAsyncEnumerable<byte> ReadBytesAsync(
+        byte[] buffer, uint offset, uint count,
+        CancellationToken cancellationToken) {
+        uint receiveGeneration = this.BeginReceiveSequence();
+        try {
+            ReusableValueTaskSource<uint> readCompletion =
+                new ReusableValueTaskSource<uint>();
+            bool readStarted = false;
+            while (true) {
+                if (readStarted) { readCompletion.Reset(); }
+                readStarted = true;
+                uint received = await this.ReadBytesTransferAsync(
+                    buffer, offset, count, cancellationToken, readCompletion,
+                    receiveGeneration);
+                if (received == 0u) yield break;
+                for (uint index = 0u; index < received; index += 1u) {
+                    yield return buffer[offset + index];
+                }
+            }
+        } finally {
+            this.FinishReceiveSequence();
+        }
+    }
+
+    // Allows an owner that manages reusable read lifetimes to provide the
+    // completion source. Reset remains guarded until the current read has been
+    // consumed and its native callback has detached.
+    public async IAsyncEnumerable<byte> ReadBytesAsyncWithSource(
+        byte[] buffer, uint offset, uint count,
+        CancellationToken cancellationToken,
+        ReusableValueTaskSource<uint> completionSource) {
+        if (completionSource == null) throw new ArgumentNullException("completionSource");
+        uint readVersion = completionSource.GetVersion();
+        bool readStarted = false;
+        uint receiveGeneration = this.BeginReceiveSequence();
+        try {
+            while (true) {
+                if (readStarted) {
+                    completionSource.Reset();
+                    readVersion = completionSource.GetVersion();
+                }
+                readStarted = true;
+                uint received = await this.ReadBytesTransferAsync(
+                    buffer, offset, count, cancellationToken, completionSource,
+                    receiveGeneration);
+                if (completionSource.GetVersion() != readVersion) {
+                    throw new InvalidOperationException(
+                        "The reusable completion source changed during a read.");
+                }
+                if (received == 0u) yield break;
+                for (uint index = 0u; index < received; index += 1u) {
+                    yield return buffer[offset + index];
+                }
+            }
+        } finally {
+            this.FinishReceiveSequence();
+        }
+    }
+
+    private uint BeginReceiveSequence() {
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            EnsureConnected();
+            ReleaseCompletedTransfer(false);
+            if (_receiveActive) {
+                throw new InvalidOperationException(
+                    "A socket receive is already pending.");
+            }
+            _receiveActive = true;
+            _receiveSequenceActive = true;
+            _receiveTask = null;
+            _receiveGeneration += 1u;
+            return _receiveGeneration;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    private void FinishReceiveSequence() {
+        _lifecycleMutex.Lock();
+        try {
+            if (_receiveActive && _receiveSequenceActive) {
+                _receiveActive = false;
+                _receiveSequenceActive = false;
+                _receiveTask = null;
+            }
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    public IAsyncEnumerable<byte> ReadBytesAsync(
+        byte[] buffer, uint offset, uint count) {
+        return ReadBytesAsync(buffer, offset, count, CancellationToken.None);
+    }
+
+    public Task<uint> ReadAsync(
+        byte[] buffer,
+        uint offset,
+        uint count,
+        CancellationToken cancellationToken) {
+        return StartTransferAsync(buffer, offset, count,
+            cancellationToken, false);
+    }
+
+    public Task<uint> WriteAsync(
+        byte[] buffer,
+        uint offset,
+        uint count) {
+        return WriteAsync(buffer, offset, count, CancellationToken.None);
+    }
+
+    public Task<uint> WriteAsync(
+        byte[] buffer,
+        uint offset,
+        uint count,
+        CancellationToken cancellationToken) {
+        return StartTransferAsync(buffer, offset, count,
+            cancellationToken, true);
+    }
+
+    private Task<uint> StartTransferAsync(
+        byte[] buffer,
+        uint offset,
+        uint count,
+        CancellationToken cancellationToken,
+        bool writable) {
+        Task<uint> transfer = null;
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            ValidateBuffer(buffer, offset, count);
+            EnsureConnected();
+            ReleaseCompletedTransfer(writable);
+            if (writable ? _sendActive : _receiveActive) {
+                throw new InvalidOperationException(writable
+                    ? "A socket send is already pending."
+                    : "A socket receive is already pending.");
+            }
+            if (writable) {
+                _sendActive = true;
+            } else {
+                _receiveActive = true;
+                _receiveSequenceActive = false;
+                _receiveGeneration += 1u;
+            }
+            try {
+                transfer = writable
+                    ? SocketRuntime.WriteAsync(_nativeHandle, buffer, offset,
+                        count, cancellationToken)
+                    : SocketRuntime.ReadAsync(_nativeHandle, buffer, offset,
+                        count, cancellationToken);
+                if (writable) _sendTask = transfer;
+                else _receiveTask = transfer;
+            } catch (Exception) {
+                if (writable) {
+                    _sendActive = false;
+                    _sendTask = null;
+                } else {
+                    _receiveActive = false;
+                    _receiveSequenceActive = false;
+                    _receiveTask = null;
+                }
+                throw;
+            }
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        return transfer;
+    }
+
+    internal ValueTask<uint> ReadBytesTransferAsync(
+        byte[] buffer,
+        uint offset,
+        uint count,
+        CancellationToken cancellationToken,
+        ReusableValueTaskSource<uint> completionSource,
+        uint receiveGeneration) {
+        ValueTask<uint> transfer = new ValueTask<uint>();
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            ValidateBuffer(buffer, offset, count);
+            EnsureConnected();
+            if (!_receiveActive || !_receiveSequenceActive ||
+                receiveGeneration != _receiveGeneration) {
+                throw new InvalidOperationException(
+                    "The socket receive sequence is no longer active.");
+            }
+            transfer = SocketRuntime.ReadBytesTransferAsync(
+                _nativeHandle, buffer, offset, count, cancellationToken,
+                completionSource);
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        // The enumeration owns the receive slot until its finally block runs.
+        return transfer;
+    }
+
+    private void ReleaseCompletedTransfer(bool writable) {
+        if (writable) {
+            if (_sendActive && _sendTask != null && _sendTask.IsCompleted) {
+                _sendActive = false;
+                _sendTask = null;
+            }
+            return;
+        }
+        if (!_receiveActive) return;
+        bool completed = !_receiveSequenceActive &&
+            _receiveTask != null && _receiveTask.IsCompleted;
+        if (completed) {
+            _receiveActive = false;
+            _receiveTask = null;
+        }
+    }
+
+    public void Dispose() {
+        ulong nativeHandle = ULong.MaxValue;
+        TaskCompletionSource connectCompletion = null;
+        CancellationTokenSource connectCancellation = null;
+        bool disposeHostConnect = false;
+        bool shouldDispose = false;
+        _lifecycleMutex.Lock();
+        try {
+            if (!_disposed) {
+                shouldDispose = true;
+                nativeHandle = _nativeHandle;
+                connectCompletion = _hostConnectCompletion;
+                connectCancellation = _hostConnectCancellation;
+                if (connectCompletion != null &&
+                    !connectCompletion.Task.IsCompleted &&
+                    TryFinalizeHostConnect(connectCompletion)) {
+                    disposeHostConnect = true;
+                }
+                _nativeHandle = ULong.MaxValue;
+                _disposed = true;
+                _state = 5u;
+            }
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+        if (!shouldDispose) return;
+
+        if (disposeHostConnect &&
+            !TaskScheduler.CanRunContinuationsOnCurrentThread()) {
+            Exception closeError = null;
+            try {
+                CloseNativeHandle(nativeHandle);
+            } catch (Exception error) {
+                closeError = error;
+            }
+            Socket socket = this;
+            TaskCompletionSource completion = connectCompletion;
+            CancellationTokenSource cancellation = connectCancellation;
+            Exception capturedCloseError = closeError;
+            TaskScheduler.PostFromThread(() =>
+                socket.FinishCrossThreadDispose(
+                    completion, cancellation, capturedCloseError));
+            return;
+        }
+
+        Exception cleanupError = null;
+        if (disposeHostConnect) {
+            try {
+                CleanupHostConnect(connectCompletion);
+            } catch (Exception error) {
+                cleanupError = error;
+            }
+        }
+        try {
+            CloseNativeHandle(nativeHandle);
+        } catch (Exception error) {
+            if (cleanupError == null) cleanupError = error;
+        }
+        if (disposeHostConnect) {
+            try {
+                connectCompletion.SetException(new ObjectDisposedException("Socket"));
+            } catch (Exception error) {
+                if (cleanupError == null) cleanupError = error;
+            }
+        }
+        if (connectCompletion != null && connectCancellation != null) {
+            try {
+                connectCancellation.Cancel();
+            } catch (Exception error) {
+                if (cleanupError == null) cleanupError = error;
+            }
+        }
+        if (cleanupError != null) throw cleanupError;
+    }
+
+    public void Close() { Dispose(); }
+
+    private static void ValidateBuffer(byte[] buffer, uint offset, uint count) {
+        if (buffer == null) throw new ArgumentNullException("buffer");
+        if (offset > buffer.Length) {
+            throw new ArgumentOutOfRangeException("offset");
+        }
+        if (count > buffer.Length - offset) {
+            throw new ArgumentOutOfRangeException("count");
+        }
+    }
+
+    private void EnsureNotDisposed() {
+        if (_disposed) throw new ObjectDisposedException("Socket");
+    }
+
+    private void EnsureConnected() {
+        if (_state != 3u && _state != 4u) {
+            throw new InvalidOperationException("The socket is not connected.");
+        }
+    }
+
+    private bool GetBooleanOption(int option) {
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            int value = SocketRuntime.GetOption(_nativeHandle, option);
+            if (value < 0) {
+                ThrowIfSocketError("Could not read a socket option.", -value);
+            }
+            return value != 0;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    private int GetIntegerOption(int option) {
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            int value = SocketRuntime.GetOption(_nativeHandle, option);
+            if (value < 0) {
+                ThrowIfSocketError("Could not read a socket option.", -value);
+            }
+            return value;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    private void SetIntegerOption(int option, int value) {
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (value <= 0) throw new ArgumentOutOfRangeException("value");
+            SetNativeOption(option, value);
+            if (option == 3) {
+                _receiveBufferSize = value;
+                _hasReceiveBufferSize = true;
+            } else if (option == 4) {
+                _sendBufferSize = value;
+                _hasSendBufferSize = true;
+            }
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    private void SetBooleanOption(int option, bool value) {
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            SetNativeOption(option, value ? 1 : 0);
+            if (option == 1) _noDelay = value;
+            else if (option == 2) _keepAlive = value;
+            else if (option == 6) _reuseAddress = value;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    private void EnsureConnectable(EndPoint remoteEndPoint) {
+        EnsureNotDisposed();
+        if (_hostConnectCompletion != null) {
+            throw new InvalidOperationException(
+                "A hostname connection is still completing.");
+        }
+        if (_state != 0u && _state != 1u) {
+            throw new InvalidOperationException("The socket cannot connect in its current state.");
+        }
+        if (remoteEndPoint == null) throw new ArgumentNullException("remoteEndPoint");
+        if (!(remoteEndPoint is IPEndPoint)) {
+            throw new ArgumentException("Only IP endpoints are supported.", "remoteEndPoint");
+        }
+        IPEndPoint endpoint = (IPEndPoint)remoteEndPoint;
+        if (endpoint.AddressFamily != _addressFamily &&
+            !(_addressFamily == AddressFamily.InterNetworkV6 && _dualMode &&
+                endpoint.AddressFamily == AddressFamily.InterNetwork)) {
+            throw new ArgumentException("The endpoint family does not match the socket.", "remoteEndPoint");
+        }
+    }
+
+    private int GetNativeAddressFamily(AddressFamily family) {
+        if (_addressFamily == AddressFamily.InterNetworkV6 && _dualMode) return 23;
+        return family == AddressFamily.InterNetwork ? 2 : 23;
+    }
+
+    private uint GetAddressWord0(IPAddress address) {
+        return _addressFamily == AddressFamily.InterNetworkV6 && _dualMode &&
+            address.AddressFamily == AddressFamily.InterNetwork ? 0u : address.Word0;
+    }
+
+    private uint GetAddressWord1(IPAddress address) {
+        return _addressFamily == AddressFamily.InterNetworkV6 && _dualMode &&
+            address.AddressFamily == AddressFamily.InterNetwork ? 0u : address.Word1;
+    }
+
+    private uint GetAddressWord2(IPAddress address) {
+        return _addressFamily == AddressFamily.InterNetworkV6 && _dualMode &&
+            address.AddressFamily == AddressFamily.InterNetwork ? 65535u : address.Word2;
+    }
+
+    private uint GetAddressWord3(IPAddress address) {
+        return _addressFamily == AddressFamily.InterNetworkV6 && _dualMode &&
+            address.AddressFamily == AddressFamily.InterNetwork ? address.Word0 : address.Word3;
+    }
+
+    private IPEndPoint? GetSocketEndPoint(bool remote) {
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (remote && _state != 3u && _state != 4u) return null;
+            if (!remote && _state == 0u) return null;
+            return QuerySocketEndPoint(remote);
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    private IPEndPoint QuerySocketEndPoint(bool remote) {
+        NativeSocketAddress native = SocketRuntime.GetSocketAddress(
+            _nativeHandle, remote);
+        if (native.ErrorCode != 0) {
+            ThrowIfSocketError("Could not query the socket endpoint.", native.ErrorCode);
+        }
+        AddressFamily family = native.AddressFamily == 2
+            ? AddressFamily.InterNetwork : AddressFamily.InterNetworkV6;
+        IPAddress address = family == AddressFamily.InterNetwork
+            ? new IPAddress(native.Word0 / 16777216u,
+                (native.Word0 / 65536u) % 256u,
+                (native.Word0 / 256u) % 256u, native.Word0 % 256u)
+            : new IPAddress(native.Word0, native.Word1, native.Word2,
+                native.Word3, native.ScopeId);
+        return new IPEndPoint(address, (int)native.Port);
+    }
+
+    private void ResetAfterConnectFailure() {
+        _lifecycleMutex.Lock();
+        try {
+            if (_disposed) return;
+            ulong previousHandle = _nativeHandle;
+            _nativeHandle = ULong.MaxValue;
+            _disposed = true;
+            _state = 5u;
+            Exception closeError = null;
+            try {
+                CloseNativeHandle(previousHandle);
+            } catch (Exception error) {
+                closeError = error;
+            }
+            ulong replacement = SocketRuntime.CreateSocket(
+                _addressFamily == AddressFamily.InterNetwork ? 2 : 23, 1, 6);
+            if (replacement == ULong.MaxValue) {
+                if (closeError != null) throw closeError;
+                ThrowIfSocketError(
+                    "Could not recreate the socket after connect failure.",
+                    SocketRuntime.GetLastCreateError());
+                return;
+            }
+            _nativeHandle = replacement;
+            _disposed = false;
+            _state = 0u;
+            if ((_noDelay && !RestoreOption(1, 1)) ||
+                (_keepAlive && !RestoreOption(2, 1)) ||
+                (_reuseAddress && !RestoreOption(6, 1)) ||
+                (_dualMode && !RestoreOption(5, 1)) ||
+                (_hasReceiveBufferSize &&
+                    !RestoreOption(3, _receiveBufferSize)) ||
+                (_hasSendBufferSize && !RestoreOption(4, _sendBufferSize))) {
+                ulong failedReplacement = _nativeHandle;
+                _nativeHandle = ULong.MaxValue;
+                _disposed = true;
+                _state = 5u;
+                try {
+                    CloseNativeHandle(failedReplacement);
+                } catch (Exception error) {
+                    if (closeError == null) closeError = error;
+                }
+            }
+            if (closeError != null) throw closeError;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    private bool RestoreOption(int option, int value) {
+        return SocketRuntime.SetOption(_nativeHandle, option, value) == 0;
+    }
+
+    private void SetDualMode(bool value) {
+        _lifecycleMutex.Lock();
+        try {
+            EnsureNotDisposed();
+            if (_addressFamily != AddressFamily.InterNetworkV6) {
+                throw new InvalidOperationException(
+                    "DualMode is only available for IPv6 sockets.");
+            }
+            if (_state != 0u) {
+                throw new InvalidOperationException(
+                    "DualMode must be set before bind, listen, or connect.");
+            }
+            SetNativeOption(5, value ? 1 : 0);
+            _dualMode = value;
+        } finally {
+            _lifecycleMutex.Unlock();
+        }
+    }
+
+    private void SetNativeOption(int option, int value) {
+        int errorCode = SocketRuntime.SetOption(_nativeHandle, option, value);
+        ThrowIfSocketError("Could not set a socket option.", errorCode);
+    }
+
+    private static void ThrowIfSocketError(string message, int errorCode) {
+        if (errorCode != 0) {
+            throw new SocketException(message,
+                SocketRuntime.GetNativeErrorDomainName(), errorCode);
+        }
+    }
+
+    private static void CloseNativeHandle(ulong nativeHandle) {
+        int errorCode = SocketRuntime.Close(nativeHandle);
+        ThrowIfSocketError("Could not close the socket.", errorCode);
+    }
+
+    public constructor(ulong connectedNativeHandle) {
+        int errorCode = SocketRuntime.SetNonBlocking(connectedNativeHandle);
+        if (errorCode != 0) {
+            try {
+                CloseNativeHandle(connectedNativeHandle);
+            } catch (Exception) {
+                // Preserve the configuration failure that made this handle unusable.
+            }
+            throw new SocketException("Could not configure the socket.",
+                SocketRuntime.GetNativeErrorDomainName(), errorCode);
+        }
+        _lifecycleMutex = new Mutex();
+        _nativeHandle = connectedNativeHandle;
+        _disposed = false;
+        _state = 3u;
+        _receiveActive = false;
+        _sendActive = false;
+        _receiveSequenceActive = false;
+        _receiveTask = null;
+        _sendTask = null;
+        _receiveGeneration = 0u;
+        _addressFamily = AddressFamily.Unspecified;
+        _dualMode = false;
+        _noDelay = false; _keepAlive = false; _reuseAddress = false;
+        _receiveBufferSize = 0; _sendBufferSize = 0;
+        _hasReceiveBufferSize = false; _hasSendBufferSize = false;
+        _connectTimeoutMilliseconds = 15000u;
+    }
+
+    public constructor(AddressFamily addressFamily,
+        SocketType socketType, ProtocolType protocolType) {
+        if (socketType != SocketType.Stream) {
+            throw new NotSupportedException("cxnet initially supports stream sockets only.");
+        }
+        if (protocolType != ProtocolType.Tcp) {
+            throw new NotSupportedException("cxnet initially supports TCP only.");
+        }
+        if (addressFamily != AddressFamily.InterNetwork &&
+            addressFamily != AddressFamily.InterNetworkV6) {
+            throw new NotSupportedException("The requested address family is not supported.");
+        }
+        ulong handle = SocketRuntime.CreateSocket(
+            addressFamily == AddressFamily.InterNetwork ? 2 : 23,
+            1, 6);
+        if (handle == ULong.MaxValue) {
+            ThrowIfSocketError("Could not create the socket.",
+                SocketRuntime.GetLastCreateError());
+        }
+        _lifecycleMutex = new Mutex();
+        _nativeHandle = handle;
+        _disposed = false;
+        _state = 0u;
+        _receiveActive = false;
+        _sendActive = false;
+        _receiveSequenceActive = false;
+        _receiveTask = null;
+        _sendTask = null;
+        _receiveGeneration = 0u;
+        _addressFamily = addressFamily;
+        _dualMode = false;
+        _noDelay = false; _keepAlive = false; _reuseAddress = false;
+        _receiveBufferSize = 0; _sendBufferSize = 0;
+        _hasReceiveBufferSize = false; _hasSendBufferSize = false;
+        _connectTimeoutMilliseconds = 15000u;
+    }
+
+    internal constructor(ulong acceptedHandle, AddressFamily addressFamily,
+        bool isAccepted) {
+        _lifecycleMutex = new Mutex();
+        _nativeHandle = acceptedHandle;
+        _disposed = false;
+        _state = 3u;
+        _receiveActive = false;
+        _sendActive = false;
+        _receiveSequenceActive = false;
+        _receiveTask = null;
+        _sendTask = null;
+        _receiveGeneration = 0u;
+        _addressFamily = addressFamily;
+        _dualMode = false;
+        _noDelay = false; _keepAlive = false; _reuseAddress = false;
+        _receiveBufferSize = 0; _sendBufferSize = 0;
+        _hasReceiveBufferSize = false; _hasSendBufferSize = false;
+        _connectTimeoutMilliseconds = 15000u;
+    }
+}

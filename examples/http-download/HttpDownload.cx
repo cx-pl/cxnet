@@ -1,0 +1,44 @@
+import System;
+import System.IO;
+import System.Net.Http;
+import System.Threading.Tasks;
+
+namespace Examples.HttpDownload;
+
+public static uint DownloadToFile(string requestUri, string outputPath) {
+    HttpClient client = new HttpClient();
+    Stream response = null;
+    FileStream output = null;
+    byte[] buffer = new byte[8192u];
+    uint total = 0u;
+    try {
+        Task<Stream> responseTask = client.GetStreamAsync(new Uri(requestUri));
+        TaskScheduler.RunUntil(responseTask);
+        response = responseTask.GetResult();
+        output = File.Create(outputPath);
+        while (true) {
+            Task<uint> readTask = response.ReadAsync(
+                buffer, 0u, buffer.Length);
+            TaskScheduler.RunUntil(readTask);
+            uint count = readTask.GetResult();
+            if (count == 0u) break;
+            output.Write(buffer, 0u, count);
+            total += count;
+        }
+        return total;
+    } finally {
+        if (response != null) response.Dispose();
+        if (output != null) output.Dispose();
+        client.Dispose();
+    }
+}
+
+public int Main(string[] args) {
+    if (args.Length != 2u) {
+        Console.WriteLine("usage: httpDownload <http-or-https-url> <output-file>");
+        return 2;
+    }
+    DownloadToFile(args[0u], args[1u]);
+    Console.WriteLine("download complete");
+    return 0;
+}

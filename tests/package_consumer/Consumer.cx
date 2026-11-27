@@ -1,0 +1,15 @@
+import System.Net.Http;
+
+namespace M26Consumer;
+
+public final class HttpConsumer {
+    public HttpClient CreateClient(
+        string caCertificateFile,
+        bool allowUnknownCertificateRevocation) {
+        CurlHttpMessageHandler handler = new CurlHttpMessageHandler();
+        handler.CaCertificateFile = caCertificateFile;
+        handler.AllowUnknownCertificateRevocation =
+            allowUnknownCertificateRevocation;
+        return new HttpClient(handler);
+    }
+}

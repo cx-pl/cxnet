@@ -1,0 +1,100 @@
+import System;
+import System.Net.Http.Rest;
+import System.Threading;
+
+public interface IRegistryProbe { }
+public interface IUnregisteredProbe { }
+public interface IConcurrentRegistryProbe { }
+
+public final class RegistryProbe : IRegistryProbe {
+    public RestClient Client;
+
+    public constructor(RestClient client) {
+        Client = client;
+    }
+}
+
+public final class ConcurrentRegistryProbe : IConcurrentRegistryProbe {
+    public RestClient Client;
+
+    public constructor(RestClient client) {
+        Client = client;
+    }
+}
+
+public static class RegistryProbeRegistration {
+    private static bool _registered = RestClient.RegisterGeneratedContract(
+            typeof(IRegistryProbe), Create);
+
+    private static object Create(RestClient client) {
+        return new RegistryProbe(client);
+    }
+}
+
+public static class ConcurrentRegistryProbeRegistration {
+    public static object Create(RestClient client) {
+        return new ConcurrentRegistryProbe(client);
+    }
+}
+
+public int Main() {
+    RestClient rest = RestClient.For<IRegistryProbe>();
+    IRegistryProbe contract = rest.GetContract<IRegistryProbe>();
+    if (contract == null || ((RegistryProbe)contract).Client != rest) return 1;
+
+    try {
+        rest.GetContract<IUnregisteredProbe>();
+        return 2;
+    } catch (InvalidOperationException) { }
+
+    RestClient mismatched = RestClient.For<IUnregisteredProbe>();
+    try {
+        mismatched.GetContract<IRegistryProbe>();
+        return 3;
+    } catch (InvalidOperationException) { }
+
+    AtomicInt start = new AtomicInt(0);
+    AtomicInt finished = new AtomicInt(0);
+    AtomicInt registered = new AtomicInt(0);
+    Thread first = Thread.Start(() => {
+        while (start.Value == 0) Thread.Yield();
+        if (RestClient.RegisterGeneratedContract(typeof(IConcurrentRegistryProbe),
+            ConcurrentRegistryProbeRegistration.Create)) registered.Increment();
+        finished.Increment();
+    });
+    Thread second = Thread.Start(() => {
+        while (start.Value == 0) Thread.Yield();
+        if (RestClient.RegisterGeneratedContract(typeof(IConcurrentRegistryProbe),
+            ConcurrentRegistryProbeRegistration.Create)) registered.Increment();
+        finished.Increment();
+    });
+    Thread third = Thread.Start(() => {
+        while (start.Value == 0) Thread.Yield();
+        if (RestClient.RegisterGeneratedContract(typeof(IConcurrentRegistryProbe),
+            ConcurrentRegistryProbeRegistration.Create)) registered.Increment();
+        finished.Increment();
+    });
+    Thread fourth = Thread.Start(() => {
+        while (start.Value == 0) Thread.Yield();
+        if (RestClient.RegisterGeneratedContract(typeof(IConcurrentRegistryProbe),
+            ConcurrentRegistryProbeRegistration.Create)) registered.Increment();
+        finished.Increment();
+    });
+    start.Exchange(1);
+    first.Join();
+    second.Join();
+    third.Join();
+    fourth.Join();
+    if (finished.Value != 4 || registered.Value != 1) return 4;
+
+    RestClient concurrent = RestClient.For<IConcurrentRegistryProbe>();
+    IConcurrentRegistryProbe concurrentContract =
+        concurrent.GetContract<IConcurrentRegistryProbe>();
+    if (concurrentContract == null ||
+        ((ConcurrentRegistryProbe)concurrentContract).Client != concurrent) return 5;
+
+    rest.Dispose();
+    mismatched.Dispose();
+    concurrent.Dispose();
+    return 0;
+}

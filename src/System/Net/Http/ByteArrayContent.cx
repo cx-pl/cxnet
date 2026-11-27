@@ -1,0 +1,61 @@
+import System;
+import System.Threading;
+
+namespace System.Net.Http;
+
+public class ByteArrayContent : HttpContent {
+    private static extern bool ShouldInjectDisposeFailure();
+
+    private byte[] _content;
+    private Mutex _contentMutex;
+
+    public constructor(byte[] content) {
+        if (content == null) throw new System.ArgumentNullException("content");
+        _contentMutex = new Mutex();
+        _content = new byte[content.Length];
+        for (uint index = 0u; index < content.Length; index += 1u) _content[index] = content[index];
+    }
+
+    public override byte[] ReadAsByteArray() {
+        EnsureNotDisposed();
+        byte[] content = null;
+        _contentMutex.Lock();
+        try {
+            if (_content == null) throw new System.ObjectDisposedException("ByteArrayContent");
+            content = _content;
+        } finally {
+            _contentMutex.Unlock();
+        }
+        byte[] copy = new byte[content.Length];
+        for (uint index = 0u; index < content.Length; index += 1u) copy[index] = content[index];
+        return copy;
+    }
+
+    internal override string ReadAsStringPrefix(uint maxBytes) {
+        EnsureNotDisposed();
+        byte[] content = null;
+        _contentMutex.Lock();
+        try {
+            if (_content == null) throw new System.ObjectDisposedException("ByteArrayContent");
+            content = _content;
+        } finally {
+            _contentMutex.Unlock();
+        }
+        return HttpTextEncoding.DecodePrefix(content, maxBytes,
+            HttpTextEncoding.GetCharset(Headers));
+    }
+
+    public override void Dispose() {
+        try {
+            MarkDisposed();
+        } finally {
+            _contentMutex.Lock();
+            try { _content = null; }
+            finally { _contentMutex.Unlock(); }
+        }
+        if (ShouldInjectDisposeFailure()) {
+            throw new InvalidOperationException(
+                "Injected redirected request-content disposal failure.");
+        }
+    }
+}

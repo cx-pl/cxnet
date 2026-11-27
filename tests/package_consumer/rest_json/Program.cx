@@ -1,0 +1,42 @@
+import System;
+import System.Data;
+import System.Net.Http.Rest;
+import System.Threading.Tasks;
+
+namespace M26PackageRestJsonSmoke;
+
+@Serializable
+public final class PackageDto {
+    public string Name;
+    public int Count;
+
+    public constructor() {}
+}
+
+public interface IPackageApi {
+    @Get("/package-json")
+    Task<PackageDto> Get();
+}
+
+public int Main(string[] args) {
+    if (args.Length != 1u) {
+        Console.WriteLine("usage: M26PackageRestJsonSmoke <base-address>");
+        return 2;
+    }
+
+    RestClient client = RestClient.For<IPackageApi>();
+    client.BaseAddress = new Uri(args[0u]);
+    IPackageApi api = client.GetContract<IPackageApi>();
+    try {
+        Task<PackageDto> pending = api.Get();
+        TaskScheduler.RunUntil(pending);
+        PackageDto result = pending.GetResult();
+        if (result.Name != "package-rest-json-ok" || result.Count != 27) {
+            return 1;
+        }
+        Console.WriteLine("package-only REST JSON mapping passed");
+        return 0;
+    } finally {
+        client.Dispose();
+    }
+}

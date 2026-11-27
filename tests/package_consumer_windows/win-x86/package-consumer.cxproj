@@ -1,0 +1,8 @@
+name: M26WindowsPackageConsumerX86
+version: 0.1.0
+type: Library
+targets: [win-x86]
+feeds:
+- ../../../../.build/m26-win-http-smoke-feed-20261126
+dependencies:
+- cxnet@^0.1.0

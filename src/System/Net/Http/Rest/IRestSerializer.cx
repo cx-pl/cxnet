@@ -1,0 +1,7 @@
+namespace System.Net.Http.Rest;
+
+public interface IRestSerializer<T> {
+    string ContentType { const get; }
+    string Serialize(T value, object options);
+    T Deserialize(string content, object options);
+}

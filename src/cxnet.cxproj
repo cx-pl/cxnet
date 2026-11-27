@@ -1,0 +1,60 @@
+name: cxnet
+version: 0.1.0
+type: Library
+description: CX networking library
+licence: MIT
+website: https://github.com/cx-pl/cxweb
+targets: [win-x86, win-x64, linux-x64]
+project_references:
+- ../../cxcore/src/cxcore.cxproj
+native_libraries:
+  sockets:
+    provider: os
+    visibility: private
+    windows:
+      link_libraries: [ws2_32]
+    linux: {}
+  http_transport:
+    provider: package
+    visibility: private
+    windows:
+      architectures: [x86, x64]
+      linkage: static
+      include_directories: ['binary/win-{arch}/include']
+      definitions: [CXNET_WITH_CURL, CURL_STATICLIB]
+      link_libraries:
+      - 'binary/win-{arch}/lib/libcurl.lib'
+      - 'binary/win-{arch}/lib/brotlidec.lib'
+      - 'binary/win-{arch}/lib/brotlicommon.lib'
+      - 'binary/win-{arch}/lib/zstd_static.lib'
+      - 'binary/win-{arch}/lib/zs.lib'
+      - bcrypt
+      - advapi32
+      - crypt32
+      - secur32
+      - ws2_32
+      - iphlpapi
+    linux:
+      architectures: [x64]
+      linkage: static
+      include_directories: ['binary/linux-{arch}/include']
+      definitions: [CXNET_WITH_CURL, CURL_STATICLIB]
+      link_libraries:
+      - 'binary/linux-{arch}/lib/libcurl.a'
+      - 'binary/linux-{arch}/lib/libbrotlidec.a'
+      - 'binary/linux-{arch}/lib/libbrotlicommon.a'
+      - 'binary/linux-{arch}/lib/libzstd.a'
+      - 'binary/linux-{arch}/lib/libz.a'
+      - ssl
+      - crypto
+      - pthread
+
+package:
+  root: ..
+  dependencies: ['cxcore@^0.1.0']
+  binary: [win-x86, win-x64, linux-x64]
+  sources:
+  - 'src/**/*.cx'
+  - 'include/**/*.h'
+  - 'platform/**/*.c'
+  - 'platform/**/*.h'

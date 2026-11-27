@@ -1,0 +1,582 @@
+import System;
+import System.Collections;
+import System.Diagnostics;
+import System.Net.Http;
+import System.Threading;
+
+namespace System.Net;
+
+internal final class StoredCookie {
+    public string Name;
+    public string Value;
+    public string Domain;
+    public string Path;
+    public bool HostOnly;
+    public bool Secure;
+    public ulong ExpiresAtMicroseconds;
+
+    public constructor(string name, string value, string domain, string path,
+        bool hostOnly, bool secure, ulong expiresAtMicroseconds) {
+        Name = name;
+        Value = value;
+        Domain = domain;
+        Path = path;
+        HostOnly = hostOnly;
+        Secure = secure;
+        ExpiresAtMicroseconds = expiresAtMicroseconds;
+    }
+}
+
+internal struct CookieParseResult {
+    public bool Valid;
+    public bool DeleteCookie;
+    public StoredCookie Cookie;
+
+    public constructor(bool valid, bool deleteCookie, StoredCookie cookie) {
+        Valid = valid;
+        DeleteCookie = deleteCookie;
+        Cookie = cookie;
+    }
+}
+
+internal struct CookieDateParseResult {
+    public bool Valid;
+    public DateTime Value;
+
+    public constructor(bool valid, DateTime value) {
+        Valid = valid;
+        Value = value;
+    }
+}
+
+// In-memory cookie storage for one HttpClient. It applies RFC 6265
+// host/domain/path/secure matching and Max-Age/cookie-date Expires lifetimes.
+public final class CookieContainer {
+    private List<StoredCookie> _cookies;
+    private Mutex _mutex;
+
+    private static extern bool IsPublicSuffix(string domain);
+
+    public constructor() {
+        _cookies = new List<StoredCookie>();
+        _mutex = new Mutex();
+    }
+
+    public void Add(Uri uri, string setCookieHeader) {
+        if (uri == null) throw new ArgumentNullException("uri");
+        if (!uri.IsAbsoluteUri ||
+            (uri.Scheme != "http" && uri.Scheme != "https")) {
+            throw new ArgumentException("Cookies require an absolute HTTP or HTTPS URI.", "uri");
+        }
+        if (setCookieHeader == null) throw new ArgumentNullException("setCookieHeader");
+        CookieParseResult parsed = ParseCookie(uri, setCookieHeader);
+        if (!parsed.Valid) {
+            throw new ArgumentException("The cookie header is invalid for the supplied URI.", "setCookieHeader");
+        }
+        Store(uri, parsed.Cookie, parsed.DeleteCookie);
+    }
+
+    public string GetCookieHeader(Uri uri) {
+        if (uri == null) throw new ArgumentNullException("uri");
+        if (!uri.IsAbsoluteUri ||
+            (uri.Scheme != "http" && uri.Scheme != "https")) {
+            throw new ArgumentException("Cookies require an absolute HTTP or HTTPS URI.", "uri");
+        }
+        _mutex.Lock();
+        try {
+            List<StoredCookie> matches = new List<StoredCookie>();
+            ulong now = MonotonicClock.GetMicroseconds();
+            uint index = 0u;
+            while (index < _cookies.Count) {
+                StoredCookie cookie = _cookies.Get(index);
+                if (cookie.ExpiresAtMicroseconds != 0u &&
+                    now >= cookie.ExpiresAtMicroseconds) {
+                    _cookies.RemoveAt(index);
+                    continue;
+                }
+                if (CookieMatches(cookie, uri)) matches.Add(cookie);
+                index += 1u;
+            }
+            SortByPathLength(matches);
+            StringBuilder header = new StringBuilder();
+            for (index = 0u; index < matches.Count; index += 1u) {
+                StoredCookie cookie = matches.Get(index);
+                if (index != 0u) header.Append("; ");
+                header.Append(cookie.Name);
+                header.Append("=");
+                header.Append(cookie.Value);
+            }
+            return header.ToString();
+        } finally {
+            _mutex.Unlock();
+        }
+    }
+
+    internal void StoreResponseCookies(Uri uri, HttpHeaders headers) {
+        if (uri == null || headers == null) return;
+        for (uint index = 0u; index < headers.Count; index += 1u) {
+            HttpHeader header = headers.Get(index);
+            if (!EqualsIgnoreCase(header.Name, "Set-Cookie")) continue;
+            CookieParseResult parsed = ParseCookie(uri, header.Value);
+            if (parsed.Valid) {
+                Store(uri, parsed.Cookie, parsed.DeleteCookie);
+            }
+        }
+    }
+
+    private void Store(Uri uri, StoredCookie cookie, bool deleteCookie) {
+        _mutex.Lock();
+        try {
+            for (uint index = 0u; index < _cookies.Count;) {
+                StoredCookie current = _cookies.Get(index);
+                if (current.Name == cookie.Name &&
+                    SameDomain(current.Domain, cookie.Domain) &&
+                    current.Path == cookie.Path) {
+                    _cookies.RemoveAt(index);
+                } else {
+                    index += 1u;
+                }
+            }
+            if (!deleteCookie) _cookies.Add(cookie);
+        } finally {
+            _mutex.Unlock();
+        }
+    }
+
+    private static CookieParseResult ParseCookie(Uri uri, string text) {
+        StoredCookie empty = new StoredCookie("", "", "", "/", true, false, 0u);
+        bool deleteCookie = false;
+        uint length = text.Length;
+        uint position = 0u;
+        uint pairEnd = FindDelimiter(text, ';', position);
+        uint equals = FindDelimiter(text, '=', position, pairEnd);
+        uint nameStart = SkipWhitespace(text, position, equals);
+        uint nameEnd = TrimWhitespaceEnd(text, nameStart, equals);
+        if (equals == pairEnd || nameStart == nameEnd) return new CookieParseResult(false, false, empty);
+        string name = Slice(text, nameStart, nameEnd);
+        if (!IsCookieName(name)) return new CookieParseResult(false, false, empty);
+        uint valueStart = SkipWhitespace(text, equals + 1u, pairEnd);
+        uint valueEnd = TrimWhitespaceEnd(text, valueStart, pairEnd);
+        string value = Slice(text, valueStart, valueEnd);
+        if (!IsCookieValue(value)) return new CookieParseResult(false, false, empty);
+
+        string domain = uri.Host;
+        string path = DefaultPath(uri.AbsolutePath);
+        bool hostOnly = true;
+        bool secure = false;
+        bool hasMaxAge = false;
+        long maxAge = 0l;
+        string expires = null;
+        position = pairEnd < length ? pairEnd + 1u : length;
+        while (position < length) {
+            uint end = FindDelimiter(text, ';', position);
+            uint attributeEquals = FindDelimiter(text, '=', position, end);
+            uint attributeStart = SkipWhitespace(text, position, attributeEquals);
+            uint attributeEnd = TrimWhitespaceEnd(text, attributeStart, attributeEquals);
+            string attributeName = Slice(text, attributeStart, attributeEnd);
+            uint attributeValueStart = attributeEquals < end
+                ? SkipWhitespace(text, attributeEquals + 1u, end) : end;
+            uint attributeValueEnd = TrimWhitespaceEnd(text, attributeValueStart, end);
+            string attributeValue = Slice(text, attributeValueStart, attributeValueEnd);
+            if (EqualsIgnoreCase(attributeName, "Domain")) {
+                // RFC 6265 ignores empty and trailing-dot Domain attributes.
+                if (attributeValue.Length != 0u &&
+                    attributeValue.Item[attributeValue.Length - 1u] != '.') {
+                    domain = NormalizeDomain(attributeValue);
+                    if (domain.Length == 0u)
+                        return new CookieParseResult(false, false, empty);
+                    if (IsPublicSuffix(domain)) {
+                        if (!EqualsIgnoreCase(uri.Host, domain))
+                            return new CookieParseResult(false, false, empty);
+                        domain = uri.Host;
+                        hostOnly = true;
+                    } else {
+                        if (!DomainMatches(uri.Host, domain))
+                            return new CookieParseResult(false, false, empty);
+                        hostOnly = false;
+                    }
+                }
+            } else if (EqualsIgnoreCase(attributeName, "Path")) {
+                if (attributeValue.Length != 0u && attributeValue.Item[0u] == '/') {
+                    path = attributeValue;
+                }
+            } else if (EqualsIgnoreCase(attributeName, "Secure")) {
+                secure = true;
+            } else if (EqualsIgnoreCase(attributeName, "Max-Age")) {
+                if (IsSignedDecimal(attributeValue)) {
+                    hasMaxAge = true;
+                    maxAge = ParseMaxAge(attributeValue);
+                }
+            } else if (EqualsIgnoreCase(attributeName, "Expires")) {
+                expires = attributeValue;
+            }
+            position = end < length ? end + 1u : length;
+        }
+        if (secure && uri.Scheme != "https") return new CookieParseResult(false, false, empty);
+
+        ulong expiresAt = 0u;
+        if (hasMaxAge) {
+            if (maxAge <= 0l) {
+                deleteCookie = true;
+            } else {
+                ulong seconds = (ulong)maxAge;
+                if (seconds > 315360000u) seconds = 315360000u;
+                expiresAt = MonotonicClock.GetMicroseconds() + seconds * 1000000u;
+            }
+        } else if (expires != null) {
+            CookieDateParseResult parsedExpiry = ParseCookieDate(expires);
+            if (parsedExpiry.Valid) {
+                DateTime expiry = parsedExpiry.Value;
+                SystemDateTimeProvider clock = new SystemDateTimeProvider();
+                DateTime currentTime = clock.GetUtcNow();
+                long deltaMilliseconds = expiry.Milliseconds - currentTime.Milliseconds;
+                if (deltaMilliseconds <= 0l) {
+                    deleteCookie = true;
+                } else {
+                    if (deltaMilliseconds > 315360000000l) {
+                        deltaMilliseconds = 315360000000l;
+                    }
+                    ulong delta = (ulong)deltaMilliseconds * 1000u;
+                    ulong now = MonotonicClock.GetMicroseconds();
+                    expiresAt = now + delta;
+                }
+            }
+        }
+        StoredCookie stored = new StoredCookie(name, value, domain, path,
+            hostOnly, secure, expiresAt);
+        return new CookieParseResult(true, deleteCookie, stored);
+    }
+
+    private static CookieDateParseResult ParseCookieDate(string value) {
+        DateTime empty = new DateTime(0L, (short)0);
+        uint length = value.Length;
+        uint position = 0u;
+        int day = -1;
+        int month = 0;
+        int year = -1;
+        int hour = -1;
+        int minute = -1;
+        int second = -1;
+        bool timeFound = false;
+        while (position < length) {
+            while (position < length &&
+                IsCookieDateDelimiter(value.Item[position])) position += 1u;
+            uint tokenStart = position;
+            while (position < length &&
+                !IsCookieDateDelimiter(value.Item[position])) position += 1u;
+            if (tokenStart == position) continue;
+            string token = Slice(value, tokenStart, position);
+            bool tokenIsDay = false;
+            uint firstColon = FindDelimiter(token, ':');
+            uint secondColon = firstColon < token.Length
+                ? FindDelimiter(token, ':', firstColon + 1u) : token.Length;
+            if (!timeFound && firstColon > 0u && firstColon <= 2u &&
+                secondColon > firstColon + 1u &&
+                secondColon - firstColon <= 3u &&
+                token.Length - secondColon > 1u &&
+                token.Length - secondColon <= 3u &&
+                FindDelimiter(token, ':', secondColon + 1u) == token.Length &&
+                IsCookieDateDigits(token, 0u, firstColon) &&
+                IsCookieDateDigits(token, firstColon + 1u, secondColon) &&
+                IsCookieDateDigits(token, secondColon + 1u, token.Length)) {
+                uint minuteLength = secondColon - firstColon - 1u;
+                uint secondLength = token.Length - secondColon - 1u;
+                if (minuteLength <= 2u && secondLength <= 2u) {
+                    hour = ParseUnsigned(token, 0u, firstColon);
+                    minute = ParseUnsigned(token, firstColon + 1u, secondColon);
+                    second = ParseUnsigned(token, secondColon + 1u, token.Length);
+                    timeFound = true;
+                }
+            }
+            if (day < 0 && token.Length <= 2u &&
+                IsCookieDateDigits(token, 0u, token.Length)) {
+                day = ParseUnsigned(token, 0u, token.Length);
+                tokenIsDay = true;
+            }
+            if (month == 0) month = ParseMonth(token);
+            if (!tokenIsDay && year < 0 && token.Length >= 2u && token.Length <= 4u &&
+                IsCookieDateDigits(token, 0u, token.Length)) {
+                year = ParseUnsigned(token, 0u, token.Length);
+            }
+        }
+        if (!timeFound || day < 0 || month == 0 || year < 0)
+            return new CookieDateParseResult(false, empty);
+        if (year < 100) year += year >= 70 ? 1900 : 2000;
+        if (year < 1601 || day < 1 || day > 31 || hour > 23 ||
+            minute > 59 || second > 59) return new CookieDateParseResult(false, empty);
+        try {
+            DateTime parsed = new DateTime(year, month, day, hour, minute, second, 0, (short)0);
+            return new CookieDateParseResult(true, parsed);
+        } catch (Exception) {
+            return new CookieDateParseResult(false, empty);
+        }
+    }
+
+    private static bool IsCookieDateDelimiter(char value) {
+        return value <= ' ' || (value >= '!' && value <= '/') ||
+            (value >= ';' && value <= '@') ||
+            (value >= '[' && value <= '`') ||
+            (value >= '{' && value <= '~') || value >= (char)0x7F;
+    }
+
+    private static bool IsCookieDateDigits(string value, uint start, uint end) {
+        if (start == end) return false;
+        for (uint index = start; index < end; index += 1u) {
+            if (value.Item[index] < '0' || value.Item[index] > '9') return false;
+        }
+        return true;
+    }
+
+    private static bool CookieMatches(StoredCookie cookie, Uri uri) {
+        if (cookie.Secure && uri.Scheme != "https") return false;
+        if (cookie.HostOnly) {
+            if (!DomainMatches(uri.Host, cookie.Domain)) return false;
+        } else if (!DomainMatches(uri.Host, cookie.Domain)) {
+            return false;
+        }
+        return PathMatches(uri.AbsolutePath, cookie.Path);
+    }
+
+    private static bool DomainMatches(string host, string domain) {
+        if (SameDomain(host, domain)) return true;
+        if (IsIpAddress(host) || host.Length <= domain.Length) return false;
+        uint offset = host.Length - domain.Length;
+        return host.Item[offset - 1u] == '.' &&
+            EqualsIgnoreCase(Slice(host, offset, host.Length), domain);
+    }
+
+    private static bool SameDomain(string left, string right) {
+        if ((left.Length != 0u && left.Item[0u] == '[') ||
+            (right.Length != 0u && right.Item[0u] == '[')) {
+            return IPAddress.AreEquivalentIpv6UriHosts(left, right);
+        }
+        return EqualsIgnoreCase(left, right);
+    }
+
+    private static bool IsIpAddress(string host) {
+        if (host.Length != 0u && host.Item[0u] == '[') return true;
+        uint component = 0u;
+        uint componentCount = 0u;
+        bool hasDigit = false;
+        for (uint index = 0u; index <= host.Length; index += 1u) {
+            char current = index < host.Length ? host.Item[index] : '.';
+            if (current >= '0' && current <= '9') {
+                uint digit = (uint)(current - '0');
+                if (component > (255u - digit) / 10u) return false;
+                component = component * 10u + digit;
+                hasDigit = true;
+            } else if (current == '.' && hasDigit && componentCount < 4u) {
+                componentCount += 1u;
+                component = 0u;
+                hasDigit = false;
+            } else {
+                return false;
+            }
+        }
+        return componentCount == 4u;
+    }
+
+    private static bool PathMatches(string requestPath, string cookiePath) {
+        if (requestPath == cookiePath) return true;
+        if (requestPath.Length <= cookiePath.Length) return false;
+        for (uint index = 0u; index < cookiePath.Length; index += 1u) {
+            if (requestPath.Item[index] != cookiePath.Item[index]) return false;
+        }
+        return cookiePath.Item[cookiePath.Length - 1u] == '/' ||
+            requestPath.Item[cookiePath.Length] == '/';
+    }
+
+    private static void SortByPathLength(List<StoredCookie> cookies) {
+        for (uint index = 1u; index < cookies.Count; index += 1u) {
+            StoredCookie value = cookies.Get(index);
+            uint insertion = index;
+            while (insertion > 0u &&
+                cookies.Get(insertion - 1u).Path.Length < value.Path.Length) {
+                cookies.Set(insertion, cookies.Get(insertion - 1u));
+                insertion -= 1u;
+            }
+            cookies.Set(insertion, value);
+        }
+    }
+
+    private static string DefaultPath(string requestPath) {
+        if (requestPath.Length == 0u || requestPath.Item[0u] != '/') return "/";
+        uint lastSlash = requestPath.Length;
+        for (uint index = requestPath.Length; index > 0u; index -= 1u) {
+            if (requestPath.Item[index - 1u] == '/') {
+                lastSlash = index - 1u;
+                break;
+            }
+        }
+        if (lastSlash == 0u) return "/";
+        return Slice(requestPath, 0u, lastSlash);
+    }
+
+    private static string NormalizeDomain(string value) {
+        uint start = value.Length != 0u && value.Item[0u] == '.' ? 1u : 0u;
+        if (start == value.Length) return "";
+        string domain = Slice(value, start, value.Length);
+        if (domain.Length == 0u) return "";
+
+        bool bracketed = domain.Item[0u] == '[';
+        string address = bracketed && domain.Item[domain.Length - 1u] == ']'
+            ? Slice(domain, 1u, domain.Length - 1u)
+            : domain;
+        if (FindDelimiter(address, '%') < address.Length) return "";
+        try {
+            IPAddress parsedAddress = new IPAddress(address);
+            if (parsedAddress.AddressFamily == AddressFamily.InterNetworkV6)
+                return "[" + parsedAddress.ToString() + "]";
+            return bracketed ? "" : parsedAddress.ToString();
+        } catch (FormatException) { }
+
+        if (bracketed) return "";
+        for (uint index = 0u; index < domain.Length; index += 1u) {
+            char current = domain.Item[index];
+            if (current == ':' || current == '/' || current == '?' ||
+                current == '#' || current == '@' || current == '\\' ||
+                current == '[' || current == ']' || current == '%') return "";
+        }
+        try {
+            return LowerAscii(new Uri("http://" + domain + "/").Host);
+        } catch (Exception) {
+            return "";
+        }
+    }
+
+    private static bool IsCookieName(string value) {
+        for (uint index = 0u; index < value.Length; index += 1u) {
+            char current = value.Item[index];
+            if (!((current >= 'A' && current <= 'Z') ||
+                (current >= 'a' && current <= 'z') ||
+                (current >= '0' && current <= '9') || current == '!' ||
+                current == '#' || current == '$' || current == '%' ||
+                current == '&' || current == '\'' || current == '*' ||
+                current == '+' || current == '-' || current == '.' ||
+                current == '^' || current == '_' || current == '`' ||
+                current == '|' || current == '~')) return false;
+        }
+        return value.Length != 0u;
+    }
+
+    private static bool IsCookieValue(string value) {
+        bool quoted = value.Length >= 2u && value.Item[0u] == '"' &&
+            value.Item[value.Length - 1u] == '"';
+        uint start = quoted ? 1u : 0u;
+        uint end = quoted ? value.Length - 1u : value.Length;
+        for (uint index = start; index < end; index += 1u) {
+            char current = value.Item[index];
+            if (current <= ' ' || current >= (char)0x7F || current == '"' ||
+                current == ',' || current == ';' || current == '\\') return false;
+        }
+        return true;
+    }
+
+    private static bool IsSignedDecimal(string value) {
+        if (value.Length == 0u) return false;
+        uint start = value.Item[0u] == '-' ? 1u : 0u;
+        if (start == value.Length) return false;
+        for (uint index = start; index < value.Length; index += 1u) {
+            if (value.Item[index] < '0' || value.Item[index] > '9') return false;
+        }
+        return true;
+    }
+
+    private static long ParseMaxAge(string value) {
+        bool negative = value.Item[0u] == '-';
+        uint start = negative ? 1u : 0u;
+        long result = 0l;
+        for (uint index = start; index < value.Length; index += 1u) {
+            if (result < 315360001l) {
+                result = result * 10l + (long)(value.Item[index] - '0');
+                if (result > 315360000l) result = 315360000l;
+            }
+        }
+        return negative ? -result : result;
+    }
+
+    private static int ParseMonth(string value) {
+        if (EqualsIgnoreCase(value, "Jan")) return 1;
+        if (EqualsIgnoreCase(value, "Feb")) return 2;
+        if (EqualsIgnoreCase(value, "Mar")) return 3;
+        if (EqualsIgnoreCase(value, "Apr")) return 4;
+        if (EqualsIgnoreCase(value, "May")) return 5;
+        if (EqualsIgnoreCase(value, "Jun")) return 6;
+        if (EqualsIgnoreCase(value, "Jul")) return 7;
+        if (EqualsIgnoreCase(value, "Aug")) return 8;
+        if (EqualsIgnoreCase(value, "Sep")) return 9;
+        if (EqualsIgnoreCase(value, "Oct")) return 10;
+        if (EqualsIgnoreCase(value, "Nov")) return 11;
+        if (EqualsIgnoreCase(value, "Dec")) return 12;
+        return 0;
+    }
+
+    private static int ParseUnsigned(string value, uint start, uint end) {
+        int result = 0;
+        if (start == end) return -1;
+        for (uint index = start; index < end; index += 1u) {
+            char current = value.Item[index];
+            if (current < '0' || current > '9') return -1;
+            result = result * 10 + (int)(current - '0');
+        }
+        return result;
+    }
+
+    private static uint FindDelimiter(string value, char delimiter) {
+        return FindDelimiter(value, delimiter, 0u, value.Length);
+    }
+
+    private static uint FindDelimiter(string value, char delimiter, uint start) {
+        return FindDelimiter(value, delimiter, start, value.Length);
+    }
+
+    private static uint FindDelimiter(string value, char delimiter, uint start, uint end) {
+        for (uint index = start; index < end; index += 1u) {
+            if (value.Item[index] == delimiter) return index;
+        }
+        return end;
+    }
+
+    private static uint SkipWhitespace(string value, uint start, uint end) {
+        while (start < end && (value.Item[start] == ' ' || value.Item[start] == '\t')) start += 1u;
+        return start;
+    }
+
+    private static uint TrimWhitespaceEnd(string value, uint start, uint end) {
+        while (end > start && (value.Item[end - 1u] == ' ' || value.Item[end - 1u] == '\t')) end -= 1u;
+        return end;
+    }
+
+    private static string Slice(string value, uint start, uint end) {
+        if (end <= start) return "";
+        StringBuilder result = new StringBuilder();
+        for (uint index = start; index < end; index += 1u) {
+            result.Append(value.Item[index]);
+        }
+        return result.ToString();
+    }
+
+    private static string LowerAscii(string value) {
+        StringBuilder result = new StringBuilder();
+        for (uint index = 0u; index < value.Length; index += 1u) {
+            char current = value.Item[index];
+            if (current >= 'A' && current <= 'Z') {
+                current = (char)((uint)current + 32u);
+            }
+            result.Append(current);
+        }
+        return result.ToString();
+    }
+
+    private static bool EqualsIgnoreCase(string left, string right) {
+        if (left.Length != right.Length) return false;
+        for (uint index = 0u; index < left.Length; index += 1u) {
+            char a = left.Item[index];
+            char b = right.Item[index];
+            if (a >= 'A' && a <= 'Z') a = (char)((uint)a + 32u);
+            if (b >= 'A' && b <= 'Z') b = (char)((uint)b + 32u);
+            if (a != b) return false;
+        }
+        return true;
+    }
+}

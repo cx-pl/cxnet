@@ -1,0 +1,39 @@
+import System;
+import System.Net;
+import System.Net.Http;
+
+namespace System.Net.Http.Rest;
+
+// Represents an unsuccessful HTTP status returned for a DTO-materializing
+// REST operation. ErrorContent is bounded by the generated call before this
+// exception is constructed. ResponseStatusCode exposes the non-null status
+// directly for CX callers while HttpRequestException retains its nullable API.
+public final class ApiException : HttpRequestException {
+    private HttpStatusCode _responseStatusCode;
+    private Uri _requestUri;
+    private HttpHeaders _responseHeaders;
+    private string _errorContent;
+
+    public HttpStatusCode ResponseStatusCode { const get => _responseStatusCode; }
+    public Uri RequestUri { const get => _requestUri; }
+    public HttpHeaders ResponseHeaders { const get => _responseHeaders; }
+    public string ErrorContent { const get => _errorContent; }
+
+    public constructor(HttpStatusCode statusCode, string message, Uri requestUri,
+        HttpHeaders responseHeaders, string errorContent)
+        : base(statusCode, message) {
+        _responseStatusCode = statusCode;
+        _requestUri = requestUri;
+        _responseHeaders = responseHeaders;
+        _errorContent = errorContent ?? "";
+    }
+
+    public constructor(HttpStatusCode statusCode, string message, Uri requestUri,
+        HttpHeaders responseHeaders, string errorContent, Exception innerException)
+        : base(statusCode, message, innerException) {
+        _responseStatusCode = statusCode;
+        _requestUri = requestUri;
+        _responseHeaders = responseHeaders;
+        _errorContent = errorContent ?? "";
+    }
+}

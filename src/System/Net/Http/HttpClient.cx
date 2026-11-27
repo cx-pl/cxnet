@@ -1,0 +1,1334 @@
+import System;
+import System.Diagnostics;
+import System.IO;
+import System.Net;
+import System.Threading;
+import System.Threading.Tasks;
+
+namespace System.Net.Http;
+
+// A handler-pipeline client with an installed platform default transport and
+// optional injected handlers for tests and custom transports.
+public final class HttpClient : IDisposable {
+    private static extern bool ShouldInjectHandlerContinuationRegistrationFailure();
+
+    private HttpMessageHandler _handler;
+    private bool _disposeHandler;
+    private Mutex _stateMutex;
+    private bool _disposed;
+    private Uri _baseAddress;
+    private uint _timeoutMilliseconds;
+    private uint _maxResponseContentBufferSize;
+    private string _proxy;
+    private string _proxyBypassList;
+    private ProxyCredentials _proxyCredentials;
+    private HttpHeaders _defaultRequestHeaders;
+    private CookieContainer _cookieContainer;
+    private bool _useCookies;
+    private CancellationTokenSource _disposeCancellationSource;
+    private bool _allowAutoRedirect;
+    private uint _maxAutomaticRedirections;
+    private bool _allowHttpsDowngrade;
+    private uint _pooledConnectionIdleTimeoutMilliseconds;
+    private uint _pooledConnectionLifetimeMilliseconds;
+    private uint _maxConnectionsPerServer;
+
+    public Uri BaseAddress {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _baseAddress; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); ValidateBaseAddress(value); _baseAddress = value; }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    public HttpHeaders DefaultRequestHeaders {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _defaultRequestHeaders; }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    public CookieContainer CookieContainer {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _cookieContainer; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try {
+                EnsureOpenLocked();
+                if (value == null) throw new ArgumentNullException("value");
+                _cookieContainer = value;
+            }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    public bool UseCookies {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _useCookies; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); _useCookies = value; }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    public uint TimeoutMilliseconds {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _timeoutMilliseconds; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try {
+                EnsureOpenLocked();
+                if (value == 0u) throw new ArgumentOutOfRangeException("value");
+                _timeoutMilliseconds = value;
+            }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    public uint MaxResponseContentBufferSize {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _maxResponseContentBufferSize; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try {
+                EnsureOpenLocked();
+                if (value == 0u || value > 67108864u) {
+                    throw new ArgumentOutOfRangeException("value");
+                }
+                _maxResponseContentBufferSize = value;
+            }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    // null preserves libcurl's environment/system proxy selection; an empty
+    // string disables proxying; an absolute HTTP(S) URI selects one explicitly.
+    public string Proxy {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _proxy; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); ValidateProxy(value); _proxy = value; }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    // Comma-separated host patterns using libcurl's CURLOPT_NOPROXY syntax.
+    public string ProxyBypassList {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _proxyBypassList; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); ValidateProxyBypassList(value); _proxyBypassList = value; }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    // Used only for proxy authentication. Credentials are not added to
+    // request headers sent to the destination server.
+    public ProxyCredentials ProxyCredentials {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _proxyCredentials; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); _proxyCredentials = value; }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    public bool AllowAutoRedirect {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _allowAutoRedirect; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); _allowAutoRedirect = value; }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    public uint MaxAutomaticRedirections {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _maxAutomaticRedirections; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try {
+                EnsureOpenLocked();
+                if (value == 0u || value > 50u) throw new ArgumentOutOfRangeException("value");
+                _maxAutomaticRedirections = value;
+            }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    public bool AllowHttpsDowngrade {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _allowHttpsDowngrade; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); _allowHttpsDowngrade = value; }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    // Idle connections are dropped after this interval. This setting is
+    // independent of the maximum pooled connection lifetime.
+    public uint PooledConnectionIdleTimeoutMilliseconds {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _pooledConnectionIdleTimeoutMilliseconds; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try {
+                EnsureOpenLocked();
+                if (value == 0u || value > 2592000000u) throw new ArgumentOutOfRangeException("value");
+                _pooledConnectionIdleTimeoutMilliseconds = value;
+            }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    public uint MaxConnectionsPerServer {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _maxConnectionsPerServer; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try {
+                EnsureOpenLocked();
+                if (value == 0u || value > 1024u) throw new ArgumentOutOfRangeException("value");
+                _maxConnectionsPerServer = value;
+            }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    // Maximum age for a pooled connection. Zero disables this age limit;
+    // PooledConnectionIdleTimeoutMilliseconds still applies.
+    public uint PooledConnectionLifetimeMilliseconds {
+        get {
+            _stateMutex.Lock();
+            try { EnsureOpenLocked(); return _pooledConnectionLifetimeMilliseconds; }
+            finally { _stateMutex.Unlock(); }
+        }
+        set {
+            _stateMutex.Lock();
+            try {
+                EnsureOpenLocked();
+                if (value > 2592000000u) throw new ArgumentOutOfRangeException("value");
+                _pooledConnectionLifetimeMilliseconds = value;
+            }
+            finally { _stateMutex.Unlock(); }
+        }
+    }
+
+    public constructor(HttpMessageHandler handler)
+        : this(handler, true) { }
+
+    public constructor() {
+        _handler = new CurlHttpMessageHandler();
+        _maxResponseContentBufferSize = 67108864u;
+        _disposeHandler = true;
+        _timeoutMilliseconds = 100000u;
+        _proxy = null;
+        _proxyBypassList = null;
+        _proxyCredentials = null;
+        _defaultRequestHeaders = new HttpHeaders();
+        _cookieContainer = new CookieContainer();
+        _useCookies = true;
+        _disposeCancellationSource = new CancellationTokenSource();
+        _allowAutoRedirect = true;
+        _maxAutomaticRedirections = 10u;
+        _pooledConnectionIdleTimeoutMilliseconds = 90000u;
+        _pooledConnectionLifetimeMilliseconds = 300000u;
+        _maxConnectionsPerServer = 10u;
+        _stateMutex = new Mutex();
+    }
+
+    public constructor(HttpMessageHandler handler, bool disposeHandler) {
+        if (handler == null) throw new ArgumentNullException("handler");
+        _handler = handler;
+        _maxResponseContentBufferSize = 67108864u;
+        if (_handler is CurlHttpMessageHandler) {
+            _maxResponseContentBufferSize =
+                ((CurlHttpMessageHandler)_handler).MaxResponseContentBufferSize;
+        }
+        _disposeHandler = disposeHandler;
+        _timeoutMilliseconds = 100000u;
+        _proxy = null;
+        _proxyBypassList = null;
+        _proxyCredentials = null;
+        _defaultRequestHeaders = new HttpHeaders();
+        _cookieContainer = new CookieContainer();
+        _useCookies = true;
+        _disposeCancellationSource = new CancellationTokenSource();
+        _allowAutoRedirect = true;
+        _maxAutomaticRedirections = 10u;
+        _pooledConnectionIdleTimeoutMilliseconds = 90000u;
+        _pooledConnectionLifetimeMilliseconds = 300000u;
+        _maxConnectionsPerServer = 10u;
+        _stateMutex = new Mutex();
+    }
+
+    private void EnsureOpen() {
+        _stateMutex.Lock();
+        try {
+            EnsureOpenLocked();
+        } finally {
+            _stateMutex.Unlock();
+        }
+    }
+
+    private void EnsureOpenLocked() {
+        if (_disposed) throw new ObjectDisposedException("HttpClient");
+    }
+
+    private static void ValidateBaseAddress(Uri value) {
+        if (value != null && (!value.IsAbsoluteUri || value.IsOpaqueUri ||
+            (value.Scheme != "http" && value.Scheme != "https") ||
+            value.UserInfo.Length != 0u)) {
+            throw new ArgumentException(
+                "BaseAddress must be an absolute hierarchical HTTP or HTTPS URI without embedded credentials.", "value");
+        }
+    }
+
+    private static void ValidateProxy(string value) {
+        if (value == null || value.Length == 0u) return;
+        Uri proxyUri = new Uri(value);
+        if (!proxyUri.IsAbsoluteUri ||
+            proxyUri.IsOpaqueUri ||
+            (proxyUri.Scheme != "http" && proxyUri.Scheme != "https") ||
+            proxyUri.UserInfo.Length != 0u) {
+            throw new ArgumentException(
+                "Proxy must be an absolute HTTP or HTTPS URI without embedded credentials.",
+                "value");
+        }
+    }
+
+    private static void ValidateProxyBypassList(string value) {
+        if (value == null) return;
+        for (uint index = 0u; index < value.Length; index += 1u) {
+            char current = value.Item[index];
+            if (current == '\r' || current == '\n' || current == '\0') {
+                throw new ArgumentException("Proxy bypass entries cannot contain line breaks or NUL.", "value");
+            }
+        }
+    }
+
+    public Task<HttpResponseMessage> SendAsync(HttpRequestMessage request) {
+        return SendAsync(request, CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        return SendAsync(request, cancellationToken, false, false, null);
+    }
+
+    // REST-generated requests transfer ownership to the client until the
+    // response task completes. Register disposal with the send completion
+    // before dispatch so callback setup cannot strand a live request.
+    internal Task<HttpResponseMessage> SendAndDisposeAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken,
+        bool responseHeadersRead) {
+        return SendAndDisposeAsync(request, cancellationToken,
+            responseHeadersRead, null);
+    }
+
+    internal Task<HttpResponseMessage> SendAndDisposeAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken,
+        bool responseHeadersRead,
+        delegate(Task<HttpResponseMessage>) => void completionCallback) {
+        try {
+            return SendAsync(request, cancellationToken,
+                responseHeadersRead, true, completionCallback);
+        } catch (Exception exception) {
+            if (request != null) {
+                try { request.Dispose(); }
+                catch (Exception) { }
+            }
+            throw exception;
+        }
+    }
+
+    public Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, HttpCompletionOption completionOption,
+        CancellationToken cancellationToken) {
+        if (completionOption != HttpCompletionOption.ResponseContentRead &&
+            completionOption != HttpCompletionOption.ResponseHeadersRead) {
+            throw new ArgumentOutOfRangeException("completionOption");
+        }
+        return SendAsync(request, cancellationToken,
+            completionOption == HttpCompletionOption.ResponseHeadersRead,
+            false, null);
+    }
+
+    public Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, HttpCompletionOption completionOption) {
+        return SendAsync(request, completionOption, CancellationToken.None);
+    }
+
+    private Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken,
+        bool responseHeadersRead, bool disposeRequestAfterSend,
+        delegate(Task<HttpResponseMessage>) => void completionCallback) {
+        EnsureOpen();
+        if (request == null) throw new ArgumentNullException("request");
+        request.EnsureOpen();
+        Uri baseAddress;
+        uint timeoutMilliseconds;
+        uint maxResponseContentBufferSize;
+        string proxy;
+        string proxyBypassList;
+        ProxyCredentials proxyCredentials;
+        CookieContainer cookieContainer;
+        bool useCookies;
+        bool allowAutoRedirect;
+        uint maxAutomaticRedirections;
+        bool allowHttpsDowngrade;
+        uint pooledConnectionIdleTimeoutMilliseconds;
+        uint maxConnectionsPerServer;
+        uint pooledConnectionLifetimeMilliseconds;
+        HttpSendCancellation sendCancellation = null;
+        _stateMutex.Lock();
+        try {
+            EnsureOpenLocked();
+            baseAddress = _baseAddress;
+            timeoutMilliseconds = _timeoutMilliseconds;
+            maxResponseContentBufferSize = _maxResponseContentBufferSize;
+            proxy = _proxy;
+            proxyBypassList = _proxyBypassList;
+            proxyCredentials = _proxyCredentials;
+            cookieContainer = _cookieContainer;
+            useCookies = _useCookies;
+            allowAutoRedirect = _allowAutoRedirect;
+            maxAutomaticRedirections = _maxAutomaticRedirections;
+            allowHttpsDowngrade = _allowHttpsDowngrade;
+            pooledConnectionIdleTimeoutMilliseconds =
+                _pooledConnectionIdleTimeoutMilliseconds;
+            maxConnectionsPerServer = _maxConnectionsPerServer;
+            pooledConnectionLifetimeMilliseconds =
+                _pooledConnectionLifetimeMilliseconds;
+            sendCancellation = new HttpSendCancellation(
+                _disposeCancellationSource.Token, cancellationToken);
+        } finally {
+            _stateMutex.Unlock();
+        }
+        CancellationToken effectiveCancellationToken = sendCancellation.Token;
+        if (effectiveCancellationToken.IsCancellationRequested) {
+            sendCancellation.Dispose();
+            if (disposeRequestAfterSend) {
+                try { request.Dispose(); }
+                catch (Exception) { }
+            }
+            Task<HttpResponseMessage> canceled =
+                new Task<HttpResponseMessage>();
+            if (completionCallback != null) {
+                canceled.OnCompleted(() => completionCallback(canceled));
+            }
+            canceled.SetCanceled();
+            return canceled;
+        }
+        ulong deadline = MonotonicClock.GetMicroseconds() +
+            ((ulong)timeoutMilliseconds * 1000u);
+        try {
+            request.BeginSend(timeoutMilliseconds, baseAddress);
+        } catch (Exception exception) {
+            try { sendCancellation.Dispose(); }
+            catch (Exception) { }
+            // Cleanup handlers may replace the active exception context.
+            throw exception;
+        }
+        try {
+            request.TransportProxy = proxy;
+            request.TransportProxyBypassList = proxyBypassList;
+            request.TransportProxyUsername = proxyCredentials == null
+                ? null : proxyCredentials.Username;
+            request.TransportProxyPassword = proxyCredentials == null
+                ? null : proxyCredentials.Password;
+            request.TransportCookieContainer = cookieContainer;
+            request.TransportUseCookies = useCookies;
+            request.TransportCookieHeaderIsGenerated = false;
+            request.TransportResponseHeadersRead = responseHeadersRead;
+            request.TransportMaxResponseContentBufferSize =
+                maxResponseContentBufferSize;
+            request.TransportPooledConnectionIdleTimeoutMilliseconds =
+                pooledConnectionIdleTimeoutMilliseconds;
+            request.TransportMaxConnectionsPerServer = maxConnectionsPerServer;
+            request.TransportPooledConnectionLifetimeMilliseconds =
+                pooledConnectionLifetimeMilliseconds;
+            ValidateRequestUriForSend(request);
+            request.TransportRequestHeaders = request.Headers.Snapshot();
+            request.TransportDefaultHeaders = SnapshotDefaultHeaders(
+                request.TransportRequestHeaders);
+            request.TransportContentHeaders = request.Content == null
+                ? new HttpHeaders() : request.Content.Headers.Snapshot();
+            Task<HttpResponseMessage> completion = SendWithRedirects(request,
+                effectiveCancellationToken, allowAutoRedirect, maxAutomaticRedirections,
+                allowHttpsDowngrade, deadline, responseHeadersRead,
+                sendCancellation, disposeRequestAfterSend,
+                completionCallback);
+            return completion;
+        } catch (Exception exception) {
+            try { request.EndSend(); }
+            catch (Exception) { }
+            try { sendCancellation.Dispose(); }
+            catch (Exception) { }
+            // Cleanup handlers may replace the active exception context.
+            throw exception;
+        }
+    }
+
+    private HttpHeaders SnapshotDefaultHeaders(HttpHeaders requestHeaders) {
+        HttpHeaders snapshot = new HttpHeaders();
+        HttpHeaders defaultHeaders = _defaultRequestHeaders.Snapshot();
+        for (uint index = 0u; index < defaultHeaders.Count; index += 1u) {
+            HttpHeader header = defaultHeaders.Get(index);
+            if (!requestHeaders.Contains(header.Name)) {
+                snapshot.Add(header.Name, header.Value);
+            }
+        }
+        return snapshot;
+    }
+
+    private static void ValidateRequestUriForSend(HttpRequestMessage request) {
+        Uri requestUri = request.RequestUri;
+        if (!requestUri.IsAbsoluteUri) {
+            throw new InvalidOperationException(
+                "A relative request URI requires BaseAddress.");
+        }
+        string scheme = requestUri.Scheme;
+        if (requestUri.IsOpaqueUri ||
+            (scheme != "http" && scheme != "https")) {
+            throw new ArgumentException(
+                "Only hierarchical HTTP and HTTPS request URIs are supported.",
+                "request");
+        }
+        if (requestUri.UserInfo.Length != 0u) {
+            throw new ArgumentException(
+                "Request URIs cannot contain embedded credentials; use an Authorization header.",
+                "request");
+        }
+    }
+
+    private Task<HttpResponseMessage> SendWithRedirects(
+        HttpRequestMessage original, CancellationToken cancellationToken,
+        bool allowAutoRedirect, uint maxAutomaticRedirections,
+        bool allowHttpsDowngrade, ulong deadline,
+        bool responseHeadersRead, HttpSendCancellation sendCancellation,
+        bool disposeRequestAfterSend,
+        delegate(Task<HttpResponseMessage>) => void completionCallback) {
+        Task<HttpResponseMessage> completion = new Task<HttpResponseMessage>();
+        HttpRequestMessage request = original;
+        Task<HttpResponseMessage> sendCompletion = completion;
+        completion.OnCompleted(() => {
+            try {
+                request.EndSend();
+            } finally {
+                if (disposeRequestAfterSend) {
+                    try { request.Dispose(); }
+                    catch (Exception) { }
+                }
+                if (responseHeadersRead) {
+                    if (sendCompletion.IsFaulted || sendCompletion.IsCanceled) {
+                        sendCancellation.Dispose();
+                    } else {
+                        sendCompletion.GetResult().SetSendLifetime(
+                            sendCancellation);
+                    }
+                } else {
+                    sendCancellation.Dispose();
+                }
+            }
+        });
+        if (completionCallback != null) {
+            completion.OnCompleted(() => completionCallback(completion));
+        }
+        DispatchRedirectStep(original, original, cancellationToken, 0u,
+            allowAutoRedirect, maxAutomaticRedirections, allowHttpsDowngrade,
+            deadline, responseHeadersRead, sendCancellation, completion);
+        return completion;
+    }
+
+    private void DispatchRedirectStep(
+        HttpRequestMessage original, HttpRequestMessage current,
+        CancellationToken cancellationToken, uint redirects,
+        bool allowAutoRedirect, uint maxAutomaticRedirections,
+        bool allowHttpsDowngrade, ulong deadline,
+        bool responseHeadersRead,
+        HttpSendCancellation sendCancellation,
+        Task<HttpResponseMessage> completion) {
+        Task<HttpResponseMessage> pending = null;
+        try {
+            cancellationToken.ThrowIfCancellationRequested();
+            uint remainingTimeout = GetRemainingTimeoutMilliseconds(deadline);
+            if (current != original) current.BeginSend(remainingTimeout);
+            else current.TransportTimeoutMilliseconds = remainingTimeout;
+            ApplyRequestCookies(current);
+            pending = _handler.SendAsync(current, cancellationToken);
+            if (pending == null) throw new InvalidOperationException("The HTTP message handler returned no task.");
+            if (ShouldInjectHandlerContinuationRegistrationFailure()) {
+                throw new InvalidOperationException(
+                    "Injected handler continuation registration failure.");
+            }
+            HttpClient activeClient = this;
+            pending.OnCompleted(() => activeClient.CompleteRedirectStep(original, current,
+                cancellationToken, redirects, allowAutoRedirect,
+                maxAutomaticRedirections, allowHttpsDowngrade, deadline,
+                responseHeadersRead, sendCancellation, pending, completion));
+        } catch (OperationCanceledException) {
+            if (pending != null) {
+                try { sendCancellation.Cancel(); }
+                catch (Exception) { }
+            }
+            if (current != original) CleanupRedirectRequest(current);
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            if (pending != null) {
+                try { sendCancellation.Cancel(); }
+                catch (Exception) { }
+            }
+            if (current != original) CleanupRedirectRequest(current);
+            completion.SetFault(exception);
+        }
+    }
+
+    private static void CleanupRedirectRequest(HttpRequestMessage request) {
+        if (request == null) return;
+        try { request.EndSend(); }
+        catch (Exception) { }
+        try { request.Dispose(); }
+        catch (Exception) { }
+    }
+
+    private static void ApplyRequestCookies(HttpRequestMessage request) {
+        if (!request.TransportUseCookies || request.TransportCookieContainer == null) return;
+        if (request.TransportCookieHeaderIsGenerated) {
+            request.TransportDefaultHeaders.Remove("Cookie");
+            request.TransportCookieHeaderIsGenerated = false;
+        }
+        if (request.TransportRequestHeaders.Contains("Cookie") ||
+            request.TransportDefaultHeaders.Contains("Cookie")) return;
+        string cookieHeader = request.TransportCookieContainer.GetCookieHeader(request.RequestUri);
+        if (cookieHeader.Length == 0u) return;
+        request.TransportDefaultHeaders.Add("Cookie", cookieHeader);
+        request.TransportCookieHeaderIsGenerated = true;
+    }
+
+    private void CompleteRedirectStep(HttpRequestMessage original,
+        HttpRequestMessage current, CancellationToken cancellationToken,
+        uint redirects, bool allowAutoRedirect, uint maxAutomaticRedirections,
+        bool allowHttpsDowngrade, ulong deadline,
+        bool responseHeadersRead,
+        HttpSendCancellation sendCancellation,
+        Task<HttpResponseMessage> pending,
+        Task<HttpResponseMessage> completion) {
+        HttpResponseMessage response = null;
+        HttpRequestMessage next = null;
+        try {
+            if (current != original) current.EndSend();
+            response = pending.GetResult();
+            if (current.TransportUseCookies && current.TransportCookieContainer != null) {
+                current.TransportCookieContainer.StoreResponseCookies(
+                    current.RequestUri, response.Headers);
+            }
+            if (!allowAutoRedirect || !IsRedirectStatus(response.StatusCode)) {
+                completion.SetResult(response);
+                response = null;
+                return;
+            }
+            string location = response.Headers.GetFirstValue("Location");
+            if (location == null || location.Length == 0u) {
+                completion.SetResult(response);
+                response = null;
+                return;
+            }
+            if (redirects >= maxAutomaticRedirections) {
+                throw new HttpRequestException("The maximum number of automatic redirects was exceeded.");
+            }
+            Uri target = ResolveRedirectUri(current.RequestUri, location);
+            if (!target.IsAbsoluteUri || target.IsOpaqueUri ||
+                (target.Scheme != "http" && target.Scheme != "https")) {
+                throw new HttpRequestException("The redirect target must use HTTP or HTTPS.");
+            }
+            if (current.RequestUri.Scheme == "https" && target.Scheme == "http" && !allowHttpsDowngrade) {
+                throw new HttpRequestException("HTTPS to HTTP redirects are disabled.");
+            }
+            if (target.UserInfo.Length != 0u) {
+                throw new HttpRequestException("Redirect targets containing user information are not supported.");
+            }
+            next = CreateRedirectRequest(current, target,
+                response.StatusCode, IsSameOrigin(current.RequestUri, target));
+            response.Dispose();
+            response = null;
+            if (current != original) current.Dispose();
+            HttpRequestMessage redirectRequest = next;
+            next = null;
+            DispatchRedirectStep(original, redirectRequest, cancellationToken,
+                redirects + 1u,
+                allowAutoRedirect, maxAutomaticRedirections, allowHttpsDowngrade,
+                deadline, responseHeadersRead, sendCancellation, completion);
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        } finally {
+            if (response != null) {
+                try { response.Dispose(); }
+                catch (Exception) { }
+            }
+            if (next != null) {
+                try {
+                    next.Dispose();
+                } catch (Exception) { }
+            }
+            if (current != original) {
+                try { current.Dispose(); }
+                catch (Exception) { }
+            }
+        }
+    }
+
+    private static uint GetRemainingTimeoutMilliseconds(ulong deadline) {
+        ulong now = MonotonicClock.GetMicroseconds();
+        if (now >= deadline) throw new TimeoutException("The HTTP request timed out.");
+        ulong remainingMicroseconds = deadline - now;
+        ulong remainingMilliseconds = (remainingMicroseconds + 999u) / 1000u;
+        return (uint)remainingMilliseconds;
+    }
+
+    private static bool IsRedirectStatus(HttpStatusCode status) {
+        return status == HttpStatusCode.MovedPermanently ||
+            status == HttpStatusCode.Found || status == HttpStatusCode.SeeOther ||
+            status == HttpStatusCode.TemporaryRedirect ||
+            status == HttpStatusCode.PermanentRedirect;
+    }
+
+    private static Uri ResolveRedirectUri(Uri requestUri, string location) {
+        Uri target = new Uri(requestUri, location);
+        if (target.Fragment.Length == 0u && requestUri.Fragment.Length > 0u) {
+            target = new Uri(target.ToString() + requestUri.Fragment);
+        }
+        return target;
+    }
+
+    private static bool IsSameOrigin(Uri left, Uri right) {
+        return EqualsIgnoreCase(left.Scheme, right.Scheme) &&
+            HostsMatch(left.Host, right.Host) && left.Port == right.Port;
+    }
+
+    private static bool HostsMatch(string left, string right) {
+        if (left.Length != 0u && right.Length != 0u &&
+            (left.Item[0u] == '[' || right.Item[0u] == '[')) {
+            return IPAddress.AreEquivalentIpv6UriHosts(left, right);
+        }
+        return EqualsIgnoreCase(left, right);
+    }
+
+    private static bool EqualsIgnoreCase(string left, string right) {
+        if (left.Length != right.Length) return false;
+        for (uint index = 0u; index < left.Length; index += 1u) {
+            char a = left.Item[index];
+            char b = right.Item[index];
+            if (a >= 'A' && a <= 'Z') a = (char)((uint)a + 32u);
+            if (b >= 'A' && b <= 'Z') b = (char)((uint)b + 32u);
+            if (a != b) return false;
+        }
+        return true;
+    }
+
+    private static HttpRequestMessage CreateRedirectRequest(
+        HttpRequestMessage source, Uri target, HttpStatusCode status, bool sameOrigin) {
+        string method = source.Method.Method;
+        bool discardBody = (status == HttpStatusCode.MovedPermanently ||
+            status == HttpStatusCode.Found) && EqualsIgnoreCase(method, "POST");
+        if (status == HttpStatusCode.SeeOther && !EqualsIgnoreCase(method, "HEAD")) discardBody = true;
+        HttpMethod nextMethod = discardBody ? HttpMethod.Get : new HttpMethod(method);
+        HttpRequestMessage next = new HttpRequestMessage(nextMethod, target);
+        try {
+            next.TransportTimeoutMilliseconds = source.TransportTimeoutMilliseconds;
+            next.TransportProxy = source.TransportProxy;
+            next.TransportProxyBypassList = source.TransportProxyBypassList;
+            next.TransportProxyUsername = source.TransportProxyUsername;
+            next.TransportProxyPassword = source.TransportProxyPassword;
+            next.TransportResponseHeadersRead = source.TransportResponseHeadersRead;
+            next.TransportMaxResponseContentBufferSize =
+                source.TransportMaxResponseContentBufferSize;
+            next.TransportPooledConnectionIdleTimeoutMilliseconds =
+                source.TransportPooledConnectionIdleTimeoutMilliseconds;
+            next.TransportMaxConnectionsPerServer =
+                source.TransportMaxConnectionsPerServer;
+            next.TransportPooledConnectionLifetimeMilliseconds =
+                source.TransportPooledConnectionLifetimeMilliseconds;
+            next.TransportCookieContainer = source.TransportCookieContainer;
+            next.TransportUseCookies = source.TransportUseCookies;
+            next.TransportDefaultHeaders = new HttpHeaders();
+            for (uint index = 0u; index < source.TransportDefaultHeaders.Count; index += 1u) {
+                HttpHeader header = source.TransportDefaultHeaders.Get(index);
+                bool generatedCookie = source.TransportCookieHeaderIsGenerated &&
+                    EqualsIgnoreCase(header.Name, "Cookie");
+                if (!generatedCookie &&
+                    (sameOrigin || !IsSensitiveRedirectHeader(header.Name))) {
+                    next.TransportDefaultHeaders.Add(header.Name, header.Value);
+                }
+            }
+            for (uint index = 0u; index < source.TransportRequestHeaders.Count; index += 1u) {
+                HttpHeader header = source.TransportRequestHeaders.Get(index);
+                if (discardBody && IsContentRedirectHeader(header.Name)) continue;
+                if (!sameOrigin && IsSensitiveRedirectHeader(header.Name)) continue;
+                next.Headers.TryAddWithoutValidation(header.Name, header.Value);
+            }
+            next.TransportRequestHeaders = next.Headers.Snapshot();
+            if (!discardBody && source.Content != null) {
+                if (!source.Content.CanReplay) {
+                    throw new HttpRequestException(
+                        "The redirect requires replaying non-seekable request content.");
+                }
+                next.Content = source.Content.CreateReplayContent();
+            }
+            next.TransportContentHeaders = next.Content == null
+                ? new HttpHeaders() : next.Content.Headers.Snapshot();
+            return next;
+        } catch (Exception exception) {
+            try {
+                next.Dispose();
+            } catch (Exception) { }
+            throw exception;
+        }
+    }
+
+    private static bool IsSensitiveRedirectHeader(string name) {
+        return EqualsIgnoreCase(name, "Authorization") ||
+            EqualsIgnoreCase(name, "Proxy-Authorization") ||
+            EqualsIgnoreCase(name, "Cookie") || EqualsIgnoreCase(name, "Host");
+    }
+
+    private static bool IsContentRedirectHeader(string name) {
+        return EqualsIgnoreCase(name, "Content-Length") ||
+            EqualsIgnoreCase(name, "Content-Type") ||
+            EqualsIgnoreCase(name, "Content-Encoding") ||
+            EqualsIgnoreCase(name, "Content-Language") ||
+            EqualsIgnoreCase(name, "Content-Location") ||
+            EqualsIgnoreCase(name, "Content-MD5") ||
+            EqualsIgnoreCase(name, "Content-Range") ||
+            EqualsIgnoreCase(name, "Transfer-Encoding") ||
+            EqualsIgnoreCase(name, "Trailer") || EqualsIgnoreCase(name, "Expect");
+    }
+
+    public Task<HttpResponseMessage> GetAsync(Uri requestUri, CancellationToken cancellationToken) {
+        return SendAndDisposeAsync(
+            new HttpRequestMessage(HttpMethod.Get, requestUri),
+            cancellationToken, false);
+    }
+
+    public Task<HttpResponseMessage> GetAsync(Uri requestUri) {
+        return GetAsync(requestUri, CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> GetAsync(
+        Uri requestUri, HttpCompletionOption completionOption,
+        CancellationToken cancellationToken) {
+        if (completionOption != HttpCompletionOption.ResponseContentRead &&
+            completionOption != HttpCompletionOption.ResponseHeadersRead) {
+            throw new ArgumentOutOfRangeException("completionOption");
+        }
+        return SendAndDisposeAsync(
+            new HttpRequestMessage(HttpMethod.Get, requestUri), cancellationToken,
+            completionOption == HttpCompletionOption.ResponseHeadersRead);
+    }
+
+    public Task<HttpResponseMessage> GetAsync(
+        Uri requestUri, HttpCompletionOption completionOption) {
+        return GetAsync(requestUri, completionOption, CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> GetAsync(string requestUri, CancellationToken cancellationToken) {
+        return GetAsync(new Uri(requestUri), cancellationToken);
+    }
+
+    public Task<HttpResponseMessage> GetAsync(string requestUri) {
+        return GetAsync(new Uri(requestUri), CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> GetAsync(string requestUri,
+        HttpCompletionOption completionOption, CancellationToken cancellationToken) {
+        return GetAsync(new Uri(requestUri), completionOption, cancellationToken);
+    }
+
+    public Task<HttpResponseMessage> GetAsync(string requestUri,
+        HttpCompletionOption completionOption) {
+        return GetAsync(new Uri(requestUri), completionOption, CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> PatchAsync(Uri requestUri, HttpContent content, CancellationToken cancellationToken) {
+        HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Patch, requestUri);
+        request.Content = content;
+        return SendAndDisposeAsync(request, cancellationToken, false);
+    }
+
+    public Task<HttpResponseMessage> PatchAsync(Uri requestUri, HttpContent content) {
+        return PatchAsync(requestUri, content, CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> PatchAsync(string requestUri,
+        HttpContent content, CancellationToken cancellationToken) {
+        return PatchAsync(new Uri(requestUri), content, cancellationToken);
+    }
+
+    public Task<HttpResponseMessage> PatchAsync(string requestUri,
+        HttpContent content) {
+        return PatchAsync(new Uri(requestUri), content, CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> DeleteAsync(Uri requestUri, CancellationToken cancellationToken) {
+        return SendAndDisposeAsync(
+            new HttpRequestMessage(HttpMethod.Delete, requestUri),
+            cancellationToken, false);
+    }
+
+    public Task<HttpResponseMessage> DeleteAsync(Uri requestUri) {
+        return DeleteAsync(requestUri, CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> DeleteAsync(string requestUri,
+        CancellationToken cancellationToken) {
+        return DeleteAsync(new Uri(requestUri), cancellationToken);
+    }
+
+    public Task<HttpResponseMessage> DeleteAsync(string requestUri) {
+        return DeleteAsync(new Uri(requestUri), CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> HeadAsync(
+        Uri requestUri, CancellationToken cancellationToken) {
+        return SendAndDisposeAsync(
+            new HttpRequestMessage(HttpMethod.Head, requestUri),
+            cancellationToken, false);
+    }
+
+    public Task<HttpResponseMessage> HeadAsync(Uri requestUri) {
+        return HeadAsync(requestUri, CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> HeadAsync(string requestUri,
+        CancellationToken cancellationToken) {
+        return HeadAsync(new Uri(requestUri), cancellationToken);
+    }
+
+    public Task<HttpResponseMessage> HeadAsync(string requestUri) {
+        return HeadAsync(new Uri(requestUri), CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> OptionsAsync(
+        Uri requestUri, CancellationToken cancellationToken) {
+        return SendAndDisposeAsync(
+            new HttpRequestMessage(HttpMethod.Options, requestUri),
+            cancellationToken, false);
+    }
+
+    public Task<HttpResponseMessage> OptionsAsync(Uri requestUri) {
+        return OptionsAsync(requestUri, CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> OptionsAsync(string requestUri,
+        CancellationToken cancellationToken) {
+        return OptionsAsync(new Uri(requestUri), cancellationToken);
+    }
+
+    public Task<HttpResponseMessage> OptionsAsync(string requestUri) {
+        return OptionsAsync(new Uri(requestUri), CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> PostAsync(Uri requestUri, HttpContent content, CancellationToken cancellationToken) {
+        HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, requestUri);
+        request.Content = content;
+        return SendAndDisposeAsync(request, cancellationToken, false);
+    }
+
+    public Task<HttpResponseMessage> PostAsync(Uri requestUri, HttpContent content) {
+        return PostAsync(requestUri, content, CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> PostAsync(string requestUri,
+        HttpContent content, CancellationToken cancellationToken) {
+        return PostAsync(new Uri(requestUri), content, cancellationToken);
+    }
+
+    public Task<HttpResponseMessage> PostAsync(string requestUri,
+        HttpContent content) {
+        return PostAsync(new Uri(requestUri), content, CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> PutAsync(Uri requestUri, HttpContent content, CancellationToken cancellationToken) {
+        HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Put, requestUri);
+        request.Content = content;
+        return SendAndDisposeAsync(request, cancellationToken, false);
+    }
+
+    public Task<HttpResponseMessage> PutAsync(Uri requestUri, HttpContent content) {
+        return PutAsync(requestUri, content, CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> PutAsync(string requestUri,
+        HttpContent content, CancellationToken cancellationToken) {
+        return PutAsync(new Uri(requestUri), content, cancellationToken);
+    }
+
+    public Task<HttpResponseMessage> PutAsync(string requestUri,
+        HttpContent content) {
+        return PutAsync(new Uri(requestUri), content, CancellationToken.None);
+    }
+
+    private static void CompleteStringRead(
+        Task<HttpResponseMessage> pending, Task<string> completion) {
+        HttpResponseMessage response = null;
+        try {
+            response = pending.GetResult();
+            response.EnsureSuccessStatusCode();
+            completion.SetResult(response.Content == null
+                ? "" : response.Content.ReadAsString());
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        } finally {
+            if (response != null) response.Dispose();
+        }
+    }
+
+    public Task<string> GetStringAsync(Uri requestUri, CancellationToken cancellationToken) {
+        Task<string> completion = new Task<string>();
+        HttpRequestMessage request = new HttpRequestMessage(
+            HttpMethod.Get, requestUri);
+        try {
+            SendAndDisposeAsync(request, cancellationToken, false,
+                (Task<HttpResponseMessage> pending) =>
+                    CompleteStringRead(pending, completion));
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+        return completion;
+    }
+
+    public Task<string> GetStringAsync(Uri requestUri) {
+        return GetStringAsync(requestUri, CancellationToken.None);
+    }
+
+    public Task<string> GetStringAsync(string requestUri,
+        CancellationToken cancellationToken) {
+        return GetStringAsync(new Uri(requestUri), cancellationToken);
+    }
+
+    public Task<string> GetStringAsync(string requestUri) {
+        return GetStringAsync(new Uri(requestUri), CancellationToken.None);
+    }
+
+    private static void CompleteByteArrayRead(
+        Task<HttpResponseMessage> pending, Task<byte[]> completion) {
+        HttpResponseMessage response = null;
+        try {
+            response = pending.GetResult();
+            response.EnsureSuccessStatusCode();
+            completion.SetResult(response.Content == null
+                ? new byte[0u] : response.Content.ReadAsByteArray());
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        } finally {
+            if (response != null) response.Dispose();
+        }
+    }
+
+    public Task<byte[]> GetByteArrayAsync(Uri requestUri, CancellationToken cancellationToken) {
+        Task<byte[]> completion = new Task<byte[]>();
+        HttpRequestMessage request = new HttpRequestMessage(
+            HttpMethod.Get, requestUri);
+        try {
+            SendAndDisposeAsync(request, cancellationToken, false,
+                (Task<HttpResponseMessage> pending) =>
+                    CompleteByteArrayRead(pending, completion));
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+        return completion;
+    }
+
+    public Task<byte[]> GetByteArrayAsync(Uri requestUri) {
+        return GetByteArrayAsync(requestUri, CancellationToken.None);
+    }
+
+    public Task<byte[]> GetByteArrayAsync(string requestUri,
+        CancellationToken cancellationToken) {
+        return GetByteArrayAsync(new Uri(requestUri), cancellationToken);
+    }
+
+    public Task<byte[]> GetByteArrayAsync(string requestUri) {
+        return GetByteArrayAsync(new Uri(requestUri), CancellationToken.None);
+    }
+
+    private static void CompleteStreamRead(
+        Task<HttpResponseMessage> pending, Task<Stream> completion) {
+        HttpResponseMessage response = null;
+        try {
+            response = pending.GetResult();
+            response.EnsureSuccessStatusCode();
+            Stream contentStream = response.Content == null
+                ? new MemoryStream(new byte[0u])
+                : response.Content.ReadAsStream();
+            completion.SetResult(new ResponseOwnedStream(contentStream, response));
+            response = null;
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        } finally {
+            if (response != null) response.Dispose();
+        }
+    }
+
+    public Task<Stream> GetStreamAsync(
+        Uri requestUri, CancellationToken cancellationToken) {
+        Task<Stream> completion = new Task<Stream>();
+        HttpRequestMessage request = new HttpRequestMessage(
+            HttpMethod.Get, requestUri);
+        try {
+            SendAndDisposeAsync(request, cancellationToken, true,
+                (Task<HttpResponseMessage> pending) =>
+                    CompleteStreamRead(pending, completion));
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+        return completion;
+    }
+
+    public Task<Stream> GetStreamAsync(Uri requestUri) {
+        return GetStreamAsync(requestUri, CancellationToken.None);
+    }
+
+    public Task<Stream> GetStreamAsync(string requestUri,
+        CancellationToken cancellationToken) {
+        return GetStreamAsync(new Uri(requestUri), cancellationToken);
+    }
+
+    public Task<Stream> GetStreamAsync(string requestUri) {
+        return GetStreamAsync(new Uri(requestUri), CancellationToken.None);
+    }
+
+    public void Dispose() {
+        bool shouldDispose = false;
+        _stateMutex.Lock();
+        try {
+            if (!_disposed) {
+                _disposed = true;
+                shouldDispose = true;
+            }
+        } finally {
+            _stateMutex.Unlock();
+        }
+        if (!shouldDispose) return;
+        try {
+            _disposeCancellationSource.Cancel();
+        } catch (Exception exception) {
+            // Cancellation visits every send callback before reporting failures.
+            // Disposal is terminal even when a callback cannot post cleanup.
+        } finally {
+            if (_disposeHandler) _handler.Dispose();
+        }
+    }
+}
+
+internal final class HttpSendCancellation : IDisposable {
+    private CancellationTokenSource _source;
+    private AtomicInt _cancelStarted;
+    private Mutex _stateMutex;
+    private bool _disposed;
+    private CancellationTokenRegistration _lifetimeRegistration;
+    private CancellationTokenRegistration _callerRegistration;
+
+    public CancellationToken Token { const get => _source.Token; }
+
+    public constructor(CancellationToken lifetimeToken, CancellationToken callerToken) {
+        _source = new CancellationTokenSource();
+        _cancelStarted = new AtomicInt(0);
+        _stateMutex = new Mutex();
+        _disposed = false;
+        HttpSendCancellation state = this;
+        _lifetimeRegistration = CancellationTokenRegistration.None;
+        _callerRegistration = CancellationTokenRegistration.None;
+        try {
+            _lifetimeRegistration = lifetimeToken.Register(() => state.Cancel());
+            _callerRegistration = callerToken.Register(() => state.Cancel());
+        } catch (Exception exception) {
+            try {
+                _callerRegistration.Dispose();
+            } catch (Exception) { }
+            try {
+                _lifetimeRegistration.Dispose();
+            } catch (Exception) { }
+            throw exception;
+        }
+    }
+
+    internal void Cancel() {
+        if (_cancelStarted.CompareExchange(1, 0) == 0) _source.Cancel();
+    }
+
+    public void Dispose() {
+        CancellationTokenRegistration lifetimeRegistration =
+            CancellationTokenRegistration.None;
+        CancellationTokenRegistration callerRegistration =
+            CancellationTokenRegistration.None;
+        _stateMutex.Lock();
+        try {
+            if (_disposed) return;
+            _disposed = true;
+            lifetimeRegistration = _lifetimeRegistration;
+            callerRegistration = _callerRegistration;
+            _lifetimeRegistration = CancellationTokenRegistration.None;
+            _callerRegistration = CancellationTokenRegistration.None;
+        } finally {
+            _stateMutex.Unlock();
+        }
+        try {
+            lifetimeRegistration.Dispose();
+        } catch (Exception) { }
+        try {
+            callerRegistration.Dispose();
+        } catch (Exception) { }
+    }
+}
+
+internal final class ResponseOwnedStream : Stream {
+    private Stream _inner;
+    private HttpResponseMessage _response;
+    private bool _disposed;
+    private Mutex _stateMutex;
+
+    public override bool CanRead {
+        get {
+            Stream inner = GetInnerIfOpen();
+            return inner != null && inner.CanRead;
+        }
+    }
+    public override bool CanWrite { get { return false; } }
+    public override bool CanSeek {
+        get {
+            Stream inner = GetInnerIfOpen();
+            return inner != null && inner.CanSeek;
+        }
+    }
+
+    public constructor(Stream inner, HttpResponseMessage response) {
+        if (inner == null) throw new ArgumentNullException("inner");
+        if (response == null) throw new ArgumentNullException("response");
+        _inner = inner;
+        _response = response;
+        _stateMutex = new Mutex();
+    }
+
+    public override void Flush() {
+        GetOpenInner().Flush();
+    }
+
+    public override int Read(byte[] buffer, uint offset, uint count) {
+        return GetOpenInner().Read(buffer, offset, count);
+    }
+
+    public override Task<uint> ReadAsync(byte[] buffer, uint offset, uint count,
+        CancellationToken cancellationToken) {
+        return GetOpenInner().ReadAsync(buffer, offset, count, cancellationToken);
+    }
+
+    public override void Write(byte[] buffer, uint offset, uint count) {
+        GetOpenInner();
+        throw new NotSupportedException();
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) {
+        return GetOpenInner().Seek(offset, origin);
+    }
+
+    public override void SetLength(long value) {
+        GetOpenInner();
+        throw new NotSupportedException();
+    }
+
+    private Stream GetOpenInner() {
+        Stream inner;
+        _stateMutex.Lock();
+        try {
+            if (_disposed) throw new ObjectDisposedException("ResponseOwnedStream");
+            inner = _inner;
+        } finally {
+            _stateMutex.Unlock();
+        }
+        return inner;
+    }
+
+    private Stream GetInnerIfOpen() {
+        Stream inner;
+        _stateMutex.Lock();
+        try {
+            if (_disposed) return null;
+            inner = _inner;
+        } finally {
+            _stateMutex.Unlock();
+        }
+        return inner;
+    }
+
+    public override void Dispose() {
+        HttpResponseMessage response = null;
+        _stateMutex.Lock();
+        try {
+            if (_disposed) return;
+            _disposed = true;
+            response = _response;
+            _response = null;
+            _inner = null;
+        } finally {
+            _stateMutex.Unlock();
+        }
+        if (response != null) response.Dispose();
+    }
+}

@@ -1,0 +1,390 @@
+import System.IO;
+import System.Threading;
+import System.Threading.Tasks;
+
+namespace System.Net.Http;
+
+// Buffered stream content with a configurable maximum size. Large HTTP bodies
+// must use a transport-provided streaming path; this class deliberately fails
+// at the limit rather than growing memory without bounds.
+public final class StreamContent : HttpContent {
+    private Stream _stream;
+    private bool _leaveOpen;
+    private uint _maxBufferedBytes;
+    private byte[] _buffered;
+    private bool _canReplay;
+    private bool _transportConsumed;
+    private bool _transportReserved;
+    private bool _bufferingFailed;
+    private long _initialPosition;
+    private Mutex _disposeMutex;
+
+    internal override bool CanReplay {
+        get {
+            _disposeMutex.Lock();
+            try { return _buffered != null || _canReplay; }
+            finally { _disposeMutex.Unlock(); }
+        }
+    }
+    internal override uint BufferLimit { const get => _maxBufferedBytes; }
+
+    internal override System.Exception CreateBufferLimitException() {
+        _disposeMutex.Lock();
+        try {
+            if (_canReplay && _stream != null) {
+                try {
+                    _stream.Position = _initialPosition;
+                } catch (System.Exception) {
+                    _bufferingFailed = true;
+                }
+            } else {
+                _bufferingFailed = true;
+            }
+        } finally {
+            _disposeMutex.Unlock();
+        }
+        return new System.IO.IOException(
+            "Stream content exceeded its configured buffer limit.");
+    }
+
+    internal override void PrepareForBuffering() {
+        EnsureNotDisposed();
+        _disposeMutex.Lock();
+        try {
+            if (_stream == null) throw new System.ObjectDisposedException("StreamContent");
+            if (_buffered != null) return;
+            if (_bufferingFailed) {
+                throw new System.IO.IOException(
+                    "Stream content cannot be reused after buffering failed.");
+            }
+            if ((_transportConsumed || _transportReserved) && !_canReplay) {
+                throw new System.IO.IOException(
+                    "Non-seekable stream content cannot be replayed after sending.");
+            }
+            if (_canReplay) _stream.Position = _initialPosition;
+        } finally {
+            _disposeMutex.Unlock();
+        }
+    }
+
+    internal override void OnBufferingStarted() {
+        _disposeMutex.Lock();
+        try {
+            if (_stream == null) throw new System.ObjectDisposedException("StreamContent");
+            if (_buffered == null && !_canReplay) _bufferingFailed = true;
+        } finally {
+            _disposeMutex.Unlock();
+        }
+    }
+
+    internal override void OnBufferingCompleted(byte[] contentBytes) {
+        byte[] copy = Copy(contentBytes);
+        _disposeMutex.Lock();
+        try {
+            if (_stream == null) throw new System.ObjectDisposedException("StreamContent");
+            _buffered = copy;
+            _bufferingFailed = false;
+        } finally {
+            _disposeMutex.Unlock();
+        }
+    }
+
+    internal override void OnBufferingFailed() {
+        RecoverAfterMaterializationFailure(null);
+    }
+
+    public constructor(Stream stream)
+        : this(stream, 67108864u, false) { }
+
+    public constructor(Stream stream, uint maxBufferedBytes, bool leaveOpen) {
+        if (stream == null) throw new System.ArgumentNullException("stream");
+        if (!stream.CanRead) throw new System.ArgumentException("The content stream must be readable.", "stream");
+        if (maxBufferedBytes == 0u) throw new System.ArgumentOutOfRangeException("maxBufferedBytes");
+        _stream = stream;
+        _maxBufferedBytes = maxBufferedBytes;
+        _leaveOpen = leaveOpen;
+        _canReplay = stream.CanSeek;
+        _transportConsumed = false;
+        _transportReserved = false;
+        _bufferingFailed = false;
+        _initialPosition = _canReplay ? stream.Position : 0L;
+        _disposeMutex = new Mutex();
+    }
+
+    public override byte[] ReadAsByteArray() {
+        EnsureNotDisposed();
+        Stream source = null;
+        byte[] buffered = null;
+        _disposeMutex.Lock();
+        try {
+            if (_stream == null) throw new System.ObjectDisposedException("StreamContent");
+            if (_buffered != null) buffered = Copy(_buffered);
+            else {
+                if (_bufferingFailed) {
+                    throw new System.IO.IOException(
+                        "Stream content cannot be reused after buffering failed.");
+                }
+                if ((_transportConsumed || _transportReserved) && !_canReplay) {
+                    throw new System.IO.IOException(
+                        "Non-seekable stream content cannot be replayed after sending.");
+                }
+                source = _stream;
+                if (_canReplay) source.Position = _initialPosition;
+            }
+        } finally {
+            _disposeMutex.Unlock();
+        }
+        if (buffered != null) return buffered;
+        MemoryStream buffer = new MemoryStream();
+        byte[] materialized = null;
+        try {
+            byte[] chunk = new byte[8192u];
+            int count = source.Read(chunk, 0u, chunk.Length);
+            while (true) {
+                if (count < 0 || (uint)count > chunk.Length) {
+                    throw new System.InvalidOperationException(
+                        "The content stream returned an invalid byte count.");
+                }
+                if (count == 0) break;
+                if ((uint)count > _maxBufferedBytes - (uint)buffer.Length) {
+                    throw new System.IO.IOException("Stream content exceeded its configured buffer limit.");
+                }
+                buffer.Write(chunk, 0u, (uint)count);
+                count = source.Read(chunk, 0u, chunk.Length);
+            }
+            materialized = buffer.ToArray();
+            _disposeMutex.Lock();
+            try {
+                if (_stream == null) throw new System.ObjectDisposedException("StreamContent");
+                _buffered = materialized;
+                _bufferingFailed = false;
+            } finally {
+                _disposeMutex.Unlock();
+            }
+        } catch (System.Exception exception) {
+            RecoverAfterMaterializationFailure(source);
+            throw exception;
+        } finally {
+            buffer.Dispose();
+        }
+        return Copy(materialized);
+    }
+
+    public override Stream ReadAsStream() {
+        EnsureNotDisposed();
+        Stream result = null;
+        _disposeMutex.Lock();
+        try {
+            if (_stream == null) throw new System.ObjectDisposedException("StreamContent");
+            if (_buffered != null) result = new MemoryStream(Copy(_buffered));
+            else if (_bufferingFailed) {
+                throw new System.IO.IOException(
+                    "Stream content cannot be reused after buffering failed.");
+            } else if (!_canReplay && (_transportConsumed || _transportReserved)) {
+                throw new System.IO.IOException(
+                    "Non-seekable stream content cannot be replayed after sending.");
+            } else result = _stream;
+        } finally {
+            _disposeMutex.Unlock();
+        }
+        return result;
+    }
+
+    internal override string ReadAsStringPrefix(uint maxBytes) {
+        EnsureNotDisposed();
+        byte[] buffered = null;
+        Stream source = null;
+        long originalPosition = 0L;
+        bool restorePosition = false;
+        _disposeMutex.Lock();
+        try {
+            if (_stream == null) throw new System.ObjectDisposedException("StreamContent");
+            buffered = _buffered;
+            if (buffered == null) {
+                if (_bufferingFailed) {
+                    throw new System.IO.IOException(
+                        "Stream content cannot be reused after buffering failed.");
+                }
+                if (!_canReplay && (_transportConsumed || _transportReserved)) {
+                    throw new System.IO.IOException(
+                        "Non-seekable stream content cannot be replayed after sending.");
+                }
+                source = _stream;
+                if (_canReplay) {
+                    originalPosition = source.Position;
+                    restorePosition = true;
+                }
+            }
+        } finally {
+            _disposeMutex.Unlock();
+        }
+        string charset = HttpTextEncoding.GetCharset(Headers);
+        if (buffered != null) {
+            return HttpTextEncoding.DecodePrefix(buffered, maxBytes, charset);
+        }
+        try {
+            return ReadStringPrefixFromStream(source, maxBytes, charset);
+        } finally {
+            if (restorePosition) source.Position = originalPosition;
+        }
+    }
+
+    public override Task CopyToAsync(Stream destination,
+        CancellationToken cancellationToken) {
+        try {
+            EnsureNotDisposed();
+            ValidateCopyDestination(destination);
+            cancellationToken.ThrowIfCancellationRequested();
+            Stream source = null;
+            byte[] buffered = null;
+            _disposeMutex.Lock();
+            try {
+                if (_stream == null) throw new System.ObjectDisposedException("StreamContent");
+                if (_bufferingFailed) {
+                    throw new System.IO.IOException(
+                        "Stream content cannot be reused after buffering failed.");
+                }
+                if (_buffered != null) buffered = Copy(_buffered);
+                else {
+                    if ((_transportConsumed || _transportReserved) && !_canReplay) {
+                        throw new System.IO.IOException(
+                            "Non-seekable stream content cannot be replayed after sending.");
+                    }
+                    source = _stream;
+                    if (_canReplay) source.Position = _initialPosition;
+                    else _transportConsumed = true;
+                }
+            } finally {
+                _disposeMutex.Unlock();
+            }
+            if (buffered != null) {
+                return HttpContentCopyOperation.CopyBytesAsync(
+                    buffered, destination, cancellationToken);
+            }
+            return source.CopyToAsync(destination, cancellationToken);
+        } catch (OperationCanceledException) {
+            return HttpContentCopyOperation.CreateCanceledTask();
+        } catch (System.Exception exception) {
+            return HttpContentCopyOperation.CreateFaultedTask(exception);
+        }
+    }
+
+    internal override Stream GetTransportReadStream() {
+        EnsureNotDisposed();
+        _disposeMutex.Lock();
+        try {
+            if (_stream == null) throw new System.ObjectDisposedException("StreamContent");
+            if (_buffered != null) return null;
+            if (_bufferingFailed) {
+                throw new System.IO.IOException(
+                    "Stream content cannot be reused after buffering failed.");
+            }
+            if (!_canReplay && (_transportConsumed || _transportReserved)) {
+                throw new System.IO.IOException(
+                    "Non-seekable stream content cannot be replayed after sending.");
+            }
+            if (_canReplay) _stream.Position = _initialPosition;
+            else _transportReserved = true;
+            return _stream;
+        } finally {
+            _disposeMutex.Unlock();
+        }
+    }
+
+    internal override void OnTransportReadStarted(Stream source) {
+        _disposeMutex.Lock();
+        try {
+            if (_stream == null) throw new System.ObjectDisposedException("StreamContent");
+            if (source != _stream) {
+                throw new System.InvalidOperationException(
+                    "The transport source no longer belongs to this stream content.");
+            }
+            _transportReserved = false;
+            _transportConsumed = true;
+        } finally {
+            _disposeMutex.Unlock();
+        }
+    }
+
+    internal override void OnTransportSetupFailed(Stream source) {
+        _disposeMutex.Lock();
+        try {
+            if (source == _stream && !_transportConsumed)
+                _transportReserved = false;
+        } finally {
+            _disposeMutex.Unlock();
+        }
+    }
+
+    internal override HttpContent CreateReplayContent() {
+        EnsureNotDisposed();
+        HttpContent replay = null;
+        _disposeMutex.Lock();
+        try {
+            if (_stream == null) throw new System.ObjectDisposedException("StreamContent");
+            if (_buffered != null) {
+                replay = new ByteArrayContent(Copy(_buffered));
+            } else {
+                if (_bufferingFailed) {
+                    throw new System.IO.IOException(
+                        "Stream content cannot be replayed after buffering failed.");
+                }
+                if (!_canReplay) {
+                    throw new System.IO.IOException(
+                        "Non-seekable stream content cannot be replayed after sending.");
+                }
+                _stream.Position = _initialPosition;
+                replay = new StreamContent(_stream, _maxBufferedBytes, true);
+            }
+        } finally {
+            _disposeMutex.Unlock();
+        }
+        CopyHeadersTo(replay);
+        return replay;
+    }
+
+    private static byte[] Copy(byte[] value) {
+        byte[] copy = new byte[value.Length];
+        for (uint index = 0u; index < value.Length; index += 1u) copy[index] = value[index];
+        return copy;
+    }
+
+    private void RecoverAfterMaterializationFailure(Stream source) {
+        _disposeMutex.Lock();
+        try {
+            if (!_canReplay || _stream == null ||
+                (source != null && source != _stream)) {
+                _bufferingFailed = true;
+                return;
+            }
+            try {
+                _stream.Position = _initialPosition;
+                _bufferingFailed = false;
+            } catch (System.Exception) {
+                _bufferingFailed = true;
+            }
+        } finally {
+            _disposeMutex.Unlock();
+        }
+    }
+
+    public override void Dispose() {
+        Stream stream = null;
+        try {
+            MarkDisposed();
+        } finally {
+            _disposeMutex.Lock();
+            try {
+                stream = _stream;
+                _stream = null;
+                _buffered = null;
+                _canReplay = false;
+                _transportReserved = false;
+                _bufferingFailed = true;
+            } finally {
+                _disposeMutex.Unlock();
+            }
+            if (!_leaveOpen && stream != null) stream.Dispose();
+        }
+    }
+}

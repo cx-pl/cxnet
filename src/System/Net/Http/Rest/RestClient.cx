@@ -1,0 +1,996 @@
+import System;
+import System.Collections;
+import System.IO;
+import System.Net;
+import System.Net.Http;
+import System.Reflection;
+import System.Text;
+import System.Threading;
+import System.Threading.Tasks;
+
+namespace System.Net.Http.Rest;
+
+// Runtime owner and typed entry point for compiler-generated REST contracts.
+// It performs no I/O until a generated contract method is invoked.
+public final class RestClient : IDisposable {
+    private static List<RestContractFactory> _contractFactories;
+    private static Mutex _contractFactoryMutex;
+    private static bool _contractFactoryMutexInitialized =
+        InitializeContractFactoryMutex();
+
+    private HttpClient _httpClient;
+    private Mutex _configurationMutex;
+    private TypeInfo _contractType;
+    private bool _hasContractType;
+    private bool _ownsHttpClient;
+    private bool _started;
+    private bool _disposed;
+    private List<IRestSerializerRegistration> _serializers;
+    private object _serializerOptions;
+    private delegate(string) => string _authorizationProvider;
+
+    public Uri BaseAddress {
+        get {
+            _configurationMutex.Lock();
+            try {
+                EnsureOpen();
+                return _httpClient.BaseAddress;
+            } finally {
+                _configurationMutex.Unlock();
+            }
+        }
+        set {
+            _configurationMutex.Lock();
+            try {
+                EnsureConfigurable();
+                _httpClient.BaseAddress = value;
+            } finally {
+                _configurationMutex.Unlock();
+            }
+        }
+    }
+
+    public delegate(string) => string AuthorizationProvider {
+        get {
+            _configurationMutex.Lock();
+            try { EnsureOpen(); return _authorizationProvider; }
+            finally { _configurationMutex.Unlock(); }
+        }
+        set {
+            _configurationMutex.Lock();
+            try {
+                EnsureConfigurable();
+                _authorizationProvider = value;
+            } finally {
+                _configurationMutex.Unlock();
+            }
+        }
+    }
+
+    public object SerializerOptions {
+        get {
+            _configurationMutex.Lock();
+            try { EnsureOpen(); return _serializerOptions; }
+            finally { _configurationMutex.Unlock(); }
+        }
+        set {
+            _configurationMutex.Lock();
+            try {
+                EnsureConfigurable();
+                _serializerOptions = value;
+            } finally {
+                _configurationMutex.Unlock();
+            }
+        }
+    }
+
+    public constructor() : this(new HttpClient(), true) {}
+
+    public constructor(HttpClient httpClient, bool ownsHttpClient) {
+        if (httpClient == null) throw new ArgumentNullException("httpClient");
+        _configurationMutex = new Mutex();
+        _httpClient = httpClient;
+        _ownsHttpClient = ownsHttpClient;
+        _contractType = typeof(RestClient);
+        _hasContractType = false;
+        _started = false;
+        _disposed = false;
+    }
+
+    private constructor(HttpClient httpClient, bool ownsHttpClient,
+        TypeInfo contractType, bool hasContractType) {
+        if (httpClient == null) throw new ArgumentNullException("httpClient");
+        _configurationMutex = new Mutex();
+        _httpClient = httpClient;
+        _ownsHttpClient = ownsHttpClient;
+        _contractType = contractType;
+        _hasContractType = hasContractType;
+        _started = false;
+        _disposed = false;
+    }
+
+    public static RestClient For<T>() {
+        return CreateForContract(typeof(T));
+    }
+
+    public static RestClient For<T>(HttpClient httpClient, bool ownsHttpClient) {
+        return CreateForContract(typeof(T), httpClient, ownsHttpClient);
+    }
+
+    public T GetContract<T>() {
+        return (T)CreateContract(typeof(T));
+    }
+
+    // Generated contract methods call this before reading any mutable settings,
+    // so the first request and a concurrent configuration update are ordered.
+    public void BeginRequest() {
+        _configurationMutex.Lock();
+        try {
+            EnsureOpen();
+            _started = true;
+        } finally {
+            _configurationMutex.Unlock();
+        }
+    }
+
+    // Public bridge called by consumer-specialized For<T>() bodies.
+    public static RestClient CreateForContract(TypeInfo contractType) {
+        return new RestClient(new HttpClient(), true, contractType, true);
+    }
+
+    public static RestClient CreateForContract(TypeInfo contractType,
+        HttpClient httpClient, bool ownsHttpClient) {
+        if (httpClient == null) throw new ArgumentNullException("httpClient");
+        return new RestClient(httpClient, ownsHttpClient, contractType, true);
+    }
+
+    public void RegisterSerializer(IRestSerializerRegistration registration) {
+        _configurationMutex.Lock();
+        try {
+            EnsureConfigurable();
+            if (registration == null)
+                throw new ArgumentNullException("registration");
+            if (registration.ValueType.Hash == 0ul || registration.ContentType == null ||
+                registration.ContentType.Length == 0u)
+                throw new ArgumentException("A REST serializer registration is incomplete.");
+            if (_serializers == null)
+                _serializers = new List<IRestSerializerRegistration>();
+            for (uint index = 0u; index < _serializers.Count; index += 1u) {
+                if (_serializers.Get(index).ValueType.IsSameType(registration.ValueType) ||
+                    _serializers.Get(index).ValueType.Hash == registration.ValueType.Hash)
+                    throw new InvalidOperationException(
+                        "A REST serializer is already registered for this type.");
+            }
+            _serializers.Add(registration);
+        } finally {
+            _configurationMutex.Unlock();
+        }
+    }
+
+    public bool HasSerializer(TypeInfo valueType) {
+        EnsureOpen();
+        return FindSerializer(valueType) != null;
+    }
+
+    public string GetSerializerContentType(TypeInfo valueType,
+        string fallbackContentType) {
+        IRestSerializerRegistration registration = FindSerializer(valueType);
+        return registration == null ? fallbackContentType : registration.ContentType;
+    }
+
+    public string SerializeWithSerializer(TypeInfo valueType, object value) {
+        IRestSerializerRegistration registration;
+        object options;
+        _configurationMutex.Lock();
+        try {
+            EnsureOpen();
+            registration = FindSerializerLocked(valueType);
+            options = _serializerOptions;
+        } finally {
+            _configurationMutex.Unlock();
+        }
+        if (registration == null)
+            throw new InvalidOperationException(
+                "No REST serializer is registered for this DTO type.");
+        return registration.Serialize(value, options);
+    }
+
+    public object DeserializeWithSerializer(TypeInfo valueType, string content) {
+        IRestSerializerRegistration registration;
+        object options;
+        _configurationMutex.Lock();
+        try {
+            EnsureOpen();
+            registration = FindSerializerLocked(valueType);
+            options = _serializerOptions;
+        } finally {
+            _configurationMutex.Unlock();
+        }
+        if (registration == null)
+            throw new InvalidOperationException(
+                "No REST serializer is registered for this DTO type.");
+        return registration.Deserialize(content, options);
+    }
+
+    public void EnsureSerializerContentType(HttpContent content, TypeInfo valueType) {
+        if (content == null) throw new ArgumentNullException("content");
+        IRestSerializerRegistration registration = FindSerializer(valueType);
+        if (registration == null) {
+            EnsureJsonContentType(content);
+            return;
+        }
+        string actual = content.Headers.GetFirstValue("Content-Type");
+        if (!HasMediaTypeEssence(actual, registration.ContentType))
+            throw new InvalidOperationException(
+                "Expected serializer Content-Type '" + registration.ContentType +
+                "'; found '" + (actual ?? "<missing>") + "'.");
+    }
+
+    private IRestSerializerRegistration FindSerializer(TypeInfo valueType) {
+        _configurationMutex.Lock();
+        try {
+            EnsureOpen();
+            return FindSerializerLocked(valueType);
+        } finally {
+            _configurationMutex.Unlock();
+        }
+    }
+
+    private IRestSerializerRegistration FindSerializerLocked(TypeInfo valueType) {
+        if (valueType.Hash == 0ul || _serializers == null) return null;
+        for (uint index = 0u; index < _serializers.Count; index += 1u) {
+            IRestSerializerRegistration registration = _serializers.Get(index);
+            if (registration.ValueType.IsSameType(valueType) ||
+                registration.ValueType.Hash == valueType.Hash) return registration;
+        }
+        return null;
+    }
+
+    private bool HasMediaTypeEssence(string actual, string expected) {
+        if (actual == null || expected == null) return false;
+        uint actualEnd = actual.Length;
+        uint expectedEnd = expected.Length;
+        for (uint index = 0u; index < actual.Length; index += 1u)
+            if (actual.Item[index] == ';') { actualEnd = index; break; }
+        for (uint index = 0u; index < expected.Length; index += 1u)
+            if (expected.Item[index] == ';') { expectedEnd = index; break; }
+        uint actualStart = 0u;
+        uint expectedStart = 0u;
+        while (actualStart < actualEnd &&
+            (actual.Item[actualStart] == ' ' || actual.Item[actualStart] == '\t'))
+            actualStart += 1u;
+        while (expectedStart < expectedEnd &&
+            (expected.Item[expectedStart] == ' ' || expected.Item[expectedStart] == '\t'))
+            expectedStart += 1u;
+        while (actualEnd > actualStart &&
+            (actual.Item[actualEnd - 1u] == ' ' || actual.Item[actualEnd - 1u] == '\t'))
+            actualEnd -= 1u;
+        while (expectedEnd > expectedStart &&
+            (expected.Item[expectedEnd - 1u] == ' ' || expected.Item[expectedEnd - 1u] == '\t'))
+            expectedEnd -= 1u;
+        if (actualEnd - actualStart != expectedEnd - expectedStart) return false;
+        for (uint index = 0u; index < actualEnd - actualStart; index += 1u) {
+            char left = actual.Item[actualStart + index];
+            char right = expected.Item[expectedStart + index];
+            if (left >= 'A' && left <= 'Z') left = (char)(left + 32);
+            if (right >= 'A' && right <= 'Z') right = (char)(right + 32);
+            if (left != right) return false;
+        }
+        return true;
+    }
+
+    // Public bridge called by consumer-specialized GetContract<T>() bodies.
+    public object CreateContract(TypeInfo requestedType) {
+        EnsureOpen();
+        if (!_hasContractType || !_contractType.IsSameType(requestedType)) {
+            throw new InvalidOperationException(
+                "The requested interface does not match this RestClient contract.");
+        }
+        RestContractFactory factory = FindFactory(requestedType);
+        if (factory == null) {
+            throw new InvalidOperationException(
+                "No generated REST implementation is registered for this interface.");
+        }
+        delegate(RestClient) => object create = factory.Create;
+        return create(this);
+    }
+
+    // Generated module initializers call this for each interface contract.
+    // Referenced libraries can emit the same closed contract, so registration
+    // is idempotent by contract type and preserves the first compiled factory.
+    public static bool RegisterGeneratedContract(TypeInfo contractType,
+        delegate(RestClient) => object create) {
+        if (contractType.Hash == 0ul || create == null) {
+            throw new ArgumentException("A valid contract type and factory are required.");
+        }
+        _contractFactoryMutex.Lock();
+        try {
+            List<RestContractFactory> factories = GetFactoryRegistry();
+            for (uint index = 0u; index < factories.Count; index += 1u) {
+                RestContractFactory existing = factories.Get(index);
+                if (existing.ContractType.IsSameType(contractType)) return false;
+            }
+            factories.Add(new RestContractFactory(contractType, create));
+            return true;
+        } finally {
+            _contractFactoryMutex.Unlock();
+        }
+    }
+
+    public Task<HttpResponseMessage> SendAsync(HttpRequestMessage request) {
+        return SendAsync(request, CancellationToken.None);
+    }
+
+    // Generated contracts transfer their request and content to this call.
+    // Dispose them after success, cancellation, or failure without wrapping the
+    // transport task, so callers observe its original result and exception.
+    public Task<HttpResponseMessage> SendAndDisposeAsync(HttpRequestMessage request) {
+        return SendAndDisposeAsync(request, CancellationToken.None);
+    }
+
+    public Task<HttpResponseMessage> SendAndDisposeAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        return SendAndDisposeAsync(request, cancellationToken, false, null);
+    }
+
+    public Task<HttpResponseMessage> SendAndDisposeAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken,
+        delegate(Task<HttpResponseMessage>) => void completionCallback) {
+        return SendAndDisposeAsync(request, cancellationToken, false,
+            completionCallback);
+    }
+
+    public Task<HttpResponseMessage> SendAndDisposeAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken,
+        bool responseHeadersRead,
+        delegate(Task<HttpResponseMessage>) => void completionCallback) {
+        Task<HttpResponseMessage> pending;
+        try {
+            BeginRequest();
+            if (request == null) throw new ArgumentNullException("request");
+            pending = GetOpenHttpClient().SendAndDisposeAsync(
+                request, cancellationToken, responseHeadersRead,
+                completionCallback);
+        } catch (Exception exception) {
+            if (request != null) {
+                try { request.Dispose(); }
+                catch (Exception) { }
+            }
+            throw exception;
+        }
+        return pending;
+    }
+
+    private Task<HttpResponseMessage> SendAndDisposeHeadersAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken,
+        delegate(Task<HttpResponseMessage>) => void completionCallback) {
+        Task<HttpResponseMessage> pending;
+        try {
+            BeginRequest();
+            if (request == null) throw new ArgumentNullException("request");
+            pending = GetOpenHttpClient().SendAndDisposeAsync(
+                request, cancellationToken, true, completionCallback);
+        } catch (Exception exception) {
+            if (request != null) {
+                try { request.Dispose(); }
+                catch (Exception) { }
+            }
+            throw exception;
+        }
+        return pending;
+    }
+
+    public Task<string> SendAsStringAsync(HttpRequestMessage request) {
+        return SendAsStringAsync(request, CancellationToken.None);
+    }
+
+    public Task<string> SendAsStringAsync(HttpRequestMessage request,
+        CancellationToken cancellationToken) {
+        BeginRequest();
+        Task<string> completion = new Task<string>();
+        Uri requestUri = request == null ? null : request.RequestUri;
+        if (requestUri != null && !requestUri.IsAbsoluteUri &&
+            BaseAddress != null) {
+            requestUri = new Uri(BaseAddress, requestUri.ToString());
+        }
+        RestClient activeClient = this;
+        try {
+            SendAndDisposeAsync(request, cancellationToken, false,
+                (Task<HttpResponseMessage> pending) =>
+                    activeClient.CompleteStringResult(
+                        pending, completion, requestUri));
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+        return completion;
+    }
+
+    private void CompleteStringResult(Task<HttpResponseMessage> pending,
+        Task<string> completion, Uri requestUri) {
+        HttpResponseMessage response = null;
+        try {
+            response = pending.GetResult();
+            if (!response.IsSuccessStatusCode) {
+                completion.SetFault(CreateApiException(response, requestUri));
+            } else {
+                string responseText = response.Content == null
+                    ? "" : response.Content.ReadAsString();
+                completion.SetResult(responseText);
+            }
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        } finally {
+            if (response != null) response.Dispose();
+        }
+    }
+
+    public Task<byte[]> SendAsByteArrayAsync(HttpRequestMessage request) {
+        return SendAsByteArrayAsync(request, CancellationToken.None);
+    }
+
+    public Task<byte[]> SendAsByteArrayAsync(HttpRequestMessage request,
+        CancellationToken cancellationToken) {
+        BeginRequest();
+        Task<byte[]> completion = new Task<byte[]>();
+        Uri requestUri = request == null ? null : request.RequestUri;
+        if (requestUri != null && !requestUri.IsAbsoluteUri &&
+            BaseAddress != null) {
+            requestUri = new Uri(BaseAddress, requestUri.ToString());
+        }
+        RestClient activeClient = this;
+        try {
+            SendAndDisposeAsync(request, cancellationToken, false,
+                (Task<HttpResponseMessage> pending) =>
+                    activeClient.CompleteByteArrayResult(
+                        pending, completion, requestUri));
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+        return completion;
+    }
+
+    private void CompleteByteArrayResult(Task<HttpResponseMessage> pending,
+        Task<byte[]> completion, Uri requestUri) {
+        HttpResponseMessage response = null;
+        try {
+            response = pending.GetResult();
+            if (!response.IsSuccessStatusCode) {
+                completion.SetFault(CreateApiException(response, requestUri));
+            } else {
+                completion.SetResult(response.Content == null
+                    ? new byte[0u] : response.Content.ReadAsByteArray());
+            }
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        } finally {
+            if (response != null) response.Dispose();
+        }
+    }
+
+    public Task<Stream> SendAsStreamAsync(HttpRequestMessage request) {
+        return SendAsStreamAsync(request, CancellationToken.None);
+    }
+
+    public Task<Stream> SendAsStreamAsync(HttpRequestMessage request,
+        CancellationToken cancellationToken) {
+        BeginRequest();
+        Task<Stream> completion = new Task<Stream>();
+        Uri requestUri = request == null ? null : request.RequestUri;
+        if (requestUri != null && !requestUri.IsAbsoluteUri &&
+            BaseAddress != null) {
+            requestUri = new Uri(BaseAddress, requestUri.ToString());
+        }
+        RestClient activeClient = this;
+        try {
+            SendAndDisposeHeadersAsync(request, cancellationToken,
+                (Task<HttpResponseMessage> pending) =>
+                    activeClient.CompleteStreamResult(
+                        pending, completion, requestUri));
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+        return completion;
+    }
+
+    private void CompleteStreamResult(Task<HttpResponseMessage> pending,
+        Task<Stream> completion, Uri requestUri) {
+        HttpResponseMessage response = null;
+        try {
+            response = pending.GetResult();
+            if (!response.IsSuccessStatusCode) {
+                Task<string> errorRead = response.Content == null
+                    ? new Task<string>("")
+                    : response.Content.ReadAsStringPrefixAsync(16384u);
+                if (errorRead == null) throw new InvalidOperationException(
+                    "The response error-content read returned no task.");
+                HttpResponseMessage errorResponse = response;
+                response = null;
+                RestClient activeClient = this;
+                try {
+                    errorRead.OnCompleted(() => activeClient.CompleteStreamError(
+                        errorRead, errorResponse, completion, requestUri));
+                } catch (Exception exception) {
+                    try { errorResponse.Dispose(); }
+                    catch (Exception) { }
+                    throw exception;
+                }
+                return;
+            } else {
+                Stream contentStream = response.Content == null
+                    ? new MemoryStream(new byte[0u])
+                    : response.Content.ReadAsStream();
+                completion.SetResult(new ResponseOwnedStream(contentStream, response));
+                response = null;
+            }
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        } finally {
+            if (response != null) response.Dispose();
+        }
+    }
+
+    private void CompleteStreamError(Task<string> errorRead,
+        HttpResponseMessage response, Task<Stream> completion, Uri requestUri) {
+        string errorContent = "";
+        Exception readError = null;
+        try {
+            errorContent = errorRead.GetResult();
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+            try { response.Dispose(); } catch (Exception) { }
+            return;
+        } catch (Exception exception) {
+            readError = exception;
+        }
+        try {
+            if (readError == null) {
+                completion.SetFault(new ApiException(response.StatusCode,
+                    "Response status code does not indicate success.", requestUri,
+                    response.Headers, BoundErrorContent(errorContent)));
+            } else {
+                completion.SetFault(new ApiException(response.StatusCode,
+                    "Response status code does not indicate success.", requestUri,
+                    response.Headers, "", readError));
+            }
+        } finally {
+            try { response.Dispose(); } catch (Exception) { }
+        }
+    }
+
+    public Task<RestResponse<Stream>> SendAsStreamResponseAsync(
+        HttpRequestMessage request) {
+        return SendAsStreamResponseAsync(request, CancellationToken.None);
+    }
+
+    public Task<RestResponse<Stream>> SendAsStreamResponseAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        BeginRequest();
+        Task<RestResponse<Stream>> completion =
+            new Task<RestResponse<Stream>>();
+        RestClient activeClient = this;
+        try {
+            SendAndDisposeHeadersAsync(request, cancellationToken,
+                (Task<HttpResponseMessage> pending) =>
+                    activeClient.CompleteStreamResponse(pending, completion));
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+        return completion;
+    }
+
+    private void CompleteStreamResponse(Task<HttpResponseMessage> pending,
+        Task<RestResponse<Stream>> completion) {
+        HttpResponseMessage response = null;
+        try {
+            response = pending.GetResult();
+            if (!response.IsSuccessStatusCode) {
+                Task<string> errorRead = response.Content == null
+                    ? new Task<string>("")
+                    : response.Content.ReadAsStringPrefixAsync(16384u);
+                if (errorRead == null) throw new InvalidOperationException(
+                    "The response error-content read returned no task.");
+                HttpResponseMessage errorResponse = response;
+                response = null;
+                RestClient activeClient = this;
+                try {
+                    errorRead.OnCompleted(() => activeClient.CompleteStreamErrorResponse(
+                        errorRead, errorResponse, completion));
+                } catch (Exception exception) {
+                    try { errorResponse.Dispose(); }
+                    catch (Exception) { }
+                    throw exception;
+                }
+                return;
+            } else {
+                bool hasValue = response.Content != null &&
+                    response.StatusCode != HttpStatusCode.NoContent;
+                Stream value = hasValue
+                    ? response.Content.ReadAsStream() : null;
+                RestResponse<Stream> result = new RestResponse<Stream>(value);
+                result.SetResponse(response);
+                result.SetHasValue(hasValue);
+                result.SetErrorContent("");
+                completion.SetResult(result);
+                response = null;
+            }
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        } finally {
+            if (response != null) response.Dispose();
+        }
+    }
+
+    private void CompleteStreamErrorResponse(Task<string> errorRead,
+        HttpResponseMessage response,
+        Task<RestResponse<Stream>> completion) {
+        HttpResponseMessage ownedResponse = response;
+        string errorContent = "";
+        try {
+            errorContent = errorRead.GetResult();
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+            try { response.Dispose(); } catch (Exception) { }
+            return;
+        } catch (Exception) {
+            // Preserve the response status even when the error prefix cannot
+            // be read or decoded.
+        }
+        try {
+            RestResponse<Stream> result = new RestResponse<Stream>(null);
+            result.SetResponse(response);
+            result.SetHasValue(false);
+            result.SetErrorContent(BoundErrorContent(errorContent));
+            completion.SetResult(result);
+            ownedResponse = null;
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        } finally {
+            if (ownedResponse != null) {
+                try { ownedResponse.Dispose(); } catch (Exception) { }
+            }
+        }
+    }
+
+    public Task<RestResponse<string>> SendAsStringResponseAsync(
+        HttpRequestMessage request) {
+        return SendAsStringResponseAsync(request, CancellationToken.None);
+    }
+
+    public Task<RestResponse<string>> SendAsStringResponseAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        BeginRequest();
+        Task<RestResponse<string>> completion = new Task<RestResponse<string>>();
+        RestClient activeClient = this;
+        try {
+            SendAndDisposeAsync(request, cancellationToken, false,
+                (Task<HttpResponseMessage> pending) =>
+                    activeClient.CompleteStringResponse(pending, completion));
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+        return completion;
+    }
+
+    private void CompleteStringResponse(Task<HttpResponseMessage> pending,
+        Task<RestResponse<string>> completion) {
+        HttpResponseMessage response = null;
+        try {
+            response = pending.GetResult();
+            bool isSuccess = response.IsSuccessStatusCode;
+            string responseText = isSuccess
+                ? (response.Content == null ? "" : response.Content.ReadAsString())
+                : TryReadBoundedErrorContent(response);
+            RestResponse<string> result = new RestResponse<string>(
+                isSuccess ? responseText : "");
+            result.SetResponse(response);
+            result.SetHasValue(isSuccess && response.Content != null);
+            result.SetErrorContent(isSuccess ? "" : BoundErrorContent(responseText));
+            completion.SetResult(result);
+            response = null;
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        } finally {
+            if (response != null) response.Dispose();
+        }
+    }
+
+    public Task<RestResponse<byte[]>> SendAsByteArrayResponseAsync(
+        HttpRequestMessage request) {
+        return SendAsByteArrayResponseAsync(request, CancellationToken.None);
+    }
+
+    public Task<RestResponse<byte[]>> SendAsByteArrayResponseAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) {
+        BeginRequest();
+        Task<RestResponse<byte[]>> completion = new Task<RestResponse<byte[]>>();
+        RestClient activeClient = this;
+        try {
+            SendAndDisposeAsync(request, cancellationToken, false,
+                (Task<HttpResponseMessage> pending) =>
+                    activeClient.CompleteByteArrayResponse(pending, completion));
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        }
+        return completion;
+    }
+
+    private void CompleteByteArrayResponse(Task<HttpResponseMessage> pending,
+        Task<RestResponse<byte[]>> completion) {
+        HttpResponseMessage response = null;
+        try {
+            response = pending.GetResult();
+            bool isSuccess = response.IsSuccessStatusCode;
+            byte[] responseBytes = !isSuccess || response.Content == null
+                ? new byte[0u] : response.Content.ReadAsByteArray();
+            string errorContent = isSuccess || response.Content == null
+                ? "" : TryReadBoundedErrorContent(response);
+            RestResponse<byte[]> result = new RestResponse<byte[]>(
+                isSuccess ? responseBytes : new byte[0u]);
+            result.SetResponse(response);
+            result.SetHasValue(isSuccess && response.Content != null);
+            result.SetErrorContent(isSuccess ? "" : BoundErrorContent(errorContent));
+            completion.SetResult(result);
+            response = null;
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetFault(exception);
+        } finally {
+            if (response != null) response.Dispose();
+        }
+    }
+
+    public string BoundErrorContent(string value) {
+        if (value == null || value.Length <= 4096u) return value ?? "";
+        StringBuilder result = new StringBuilder();
+        for (uint index = 0u; index < 4096u; index += 1u)
+            result.Append(value.Item[index]);
+        return result.ToString();
+    }
+
+    // Public bridge for generated implementations in consuming projects.
+    // It reads a bounded prefix before decoding, so large error bodies do not
+    // create a second full-size string during error handling.
+    public string ReadBoundedErrorContent(HttpResponseMessage response) {
+        if (response == null) throw new ArgumentNullException("response");
+        HttpContent content = response.Content;
+        if (content == null) return "";
+        return BoundErrorContent(content.ReadAsStringPrefix(16384u));
+    }
+
+    public string TryReadBoundedErrorContent(HttpResponseMessage response) {
+        try { return ReadBoundedErrorContent(response); }
+        catch (Exception) { return ""; }
+    }
+
+    // Generated typed-result continuations use this bridge to apply the same
+    // status metadata and bounded error-body policy as built-in result shapes.
+    public ApiException CreateApiException(HttpResponseMessage response,
+        Uri requestUri, string errorContent) {
+        if (response == null) throw new ArgumentNullException("response");
+        return new ApiException(response.StatusCode,
+            "Response status code does not indicate success.", requestUri,
+            response.Headers, BoundErrorContent(errorContent));
+    }
+
+    public ApiException CreateApiException(HttpResponseMessage response,
+        Uri requestUri) {
+        if (response == null) throw new ArgumentNullException("response");
+        try {
+            return CreateApiException(response, requestUri,
+                ReadBoundedErrorContent(response));
+        } catch (Exception exception) {
+            return new ApiException(response.StatusCode,
+                "Response status code does not indicate success.", requestUri,
+                response.Headers, "", exception);
+        }
+    }
+
+    // DTO deserialization is only attempted for a declared JSON media type.
+    // Parameters such as charset are allowed after the media type essence.
+    public void EnsureJsonContentType(HttpContent content) {
+        if (content == null) throw new ArgumentNullException("content");
+        string contentType = content.Headers.GetFirstValue("Content-Type");
+        if (!IsJsonMediaType(contentType)) {
+            throw new InvalidOperationException(
+                "Expected application/json or a +json response Content-Type; found '" +
+                (contentType ?? "<missing>") + "'.");
+        }
+    }
+
+    private bool IsJsonMediaType(string contentType) {
+        if (contentType == null) return false;
+        uint essenceLength = 0u;
+        while (essenceLength < contentType.Length &&
+            contentType.Item[essenceLength] != ';') essenceLength += 1u;
+        uint start = 0u;
+        while (start < essenceLength &&
+            (contentType.Item[start] == ' ' || contentType.Item[start] == '\t'))
+            start += 1u;
+        while (essenceLength > start &&
+            (contentType.Item[essenceLength - 1u] == ' ' ||
+             contentType.Item[essenceLength - 1u] == '\t')) essenceLength -= 1u;
+        uint slash = start;
+        while (slash < essenceLength && contentType.Item[slash] != '/') slash += 1u;
+        if (slash == start || essenceLength <= slash + 1u) return false;
+        for (uint index = slash + 1u; index < essenceLength; index += 1u) {
+            if (contentType.Item[index] == '/') return false;
+        }
+        for (uint index = start; index < essenceLength; index += 1u) {
+            if (index != slash && !IsTokenCharacter(contentType.Item[index]))
+                return false;
+        }
+        if (EqualsAsciiIgnoreCase(contentType, slash + 1u,
+                essenceLength - slash - 1u, "json")) {
+            return EqualsAsciiIgnoreCase(contentType, start, slash - start,
+                "application");
+        }
+        if (essenceLength - slash - 1u < 5u) return false;
+        uint suffixStart = essenceLength - 4u;
+        if (suffixStart <= slash + 1u) return false;
+        return contentType.Item[suffixStart - 1u] == '+' &&
+            EqualsAsciiIgnoreCase(contentType, suffixStart, 4u, "json");
+    }
+
+    private bool IsTokenCharacter(char value) {
+        return (value >= 'A' && value <= 'Z') ||
+            (value >= 'a' && value <= 'z') ||
+            (value >= '0' && value <= '9') || value == '!' || value == '#' ||
+            value == '$' || value == '%' || value == '&' || value == '\'' ||
+            value == '*' || value == '+' || value == '-' || value == '.' ||
+            value == '^' || value == '_' || value == '`' || value == '|' ||
+            value == '~';
+    }
+
+    private bool EqualsAsciiIgnoreCase(string value, uint start, uint length,
+        string expected) {
+        if (length != expected.Length) return false;
+        for (uint index = 0u; index < length; index += 1u) {
+            char actual = value.Item[start + index];
+            char wanted = expected.Item[index];
+            if (actual >= 'A' && actual <= 'Z') actual = (char)((uint)actual + 32u);
+            if (wanted >= 'A' && wanted <= 'Z') wanted = (char)((uint)wanted + 32u);
+            if (actual != wanted) return false;
+        }
+        return true;
+    }
+
+    // A no-result REST operation disposes its response after the transport
+    // completes, while preserving cancellation and transport failures.
+    public Task SendAndDisposeResponseAsync(HttpRequestMessage request) {
+        return SendAndDisposeResponseAsync(request, CancellationToken.None);
+    }
+
+    public Task SendAndDisposeResponseAsync(HttpRequestMessage request,
+        CancellationToken cancellationToken) {
+        BeginRequest();
+        TaskCompletionSourceVoid completion = new TaskCompletionSourceVoid();
+        RestClient activeClient = this;
+        try {
+            SendAndDisposeAsync(request, cancellationToken, false,
+                (Task<HttpResponseMessage> pending) =>
+                    activeClient.CompleteAndDisposeResponse(
+                        pending, completion));
+        } catch (Exception exception) {
+            completion.SetException(exception);
+        }
+        return completion.Task;
+    }
+
+    private void CompleteAndDisposeResponse(Task<HttpResponseMessage> pending,
+        TaskCompletionSourceVoid completion) {
+        try {
+            HttpResponseMessage response = pending.GetResult();
+            response.Dispose();
+            completion.SetResult();
+        } catch (OperationCanceledException) {
+            completion.SetCanceled();
+        } catch (Exception exception) {
+            completion.SetException(exception);
+        }
+    }
+
+    public Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,
+        CancellationToken cancellationToken) {
+        BeginRequest();
+        if (request == null) throw new ArgumentNullException("request");
+        return GetOpenHttpClient().SendAsync(request, cancellationToken);
+    }
+
+    public void ApplyAuthorization(HttpRequestMessage request, string scheme) {
+        BeginRequest();
+        if (request == null) throw new ArgumentNullException("request");
+        if (scheme == null || scheme.Length == 0u) {
+            throw new ArgumentException("An authorization scheme is required.", "scheme");
+        }
+        for (uint index = 0u; index < scheme.Length; index += 1u) {
+            if (!IsTokenCharacter(scheme.Item[index])) {
+                throw new ArgumentException(
+                    "An authorization scheme must contain only HTTP token characters.",
+                    "scheme");
+            }
+        }
+        if (_authorizationProvider == null) {
+            throw new InvalidOperationException(
+                "This REST contract requires an authorization provider.");
+        }
+        string credentials = _authorizationProvider(scheme);
+        if (credentials == null || credentials.Length == 0u) {
+            throw new InvalidOperationException(
+                "The authorization provider returned no credentials for the requested scheme.");
+        }
+        request.Headers.Remove("Authorization");
+        request.Headers.Add("Authorization", scheme + " " + credentials);
+    }
+
+    public void Dispose() {
+        HttpClient clientToDispose = null;
+        _configurationMutex.Lock();
+        try {
+            if (_disposed) return;
+            _disposed = true;
+            if (_ownsHttpClient) clientToDispose = _httpClient;
+            _httpClient = null;
+        } finally {
+            _configurationMutex.Unlock();
+        }
+        if (clientToDispose != null) clientToDispose.Dispose();
+    }
+
+    private static RestContractFactory FindFactory(TypeInfo contractType) {
+        _contractFactoryMutex.Lock();
+        try {
+            List<RestContractFactory> factories = GetFactoryRegistry();
+            for (uint index = 0u; index < factories.Count; index += 1u) {
+                RestContractFactory factory = factories.Get(index);
+                if (factory.ContractType.IsSameType(contractType)) return factory;
+            }
+            return null;
+        } finally {
+            _contractFactoryMutex.Unlock();
+        }
+    }
+
+    private static List<RestContractFactory> GetFactoryRegistry() {
+        if (_contractFactories == null) {
+            _contractFactories = new List<RestContractFactory>();
+        }
+        return _contractFactories;
+    }
+
+    private static bool InitializeContractFactoryMutex() {
+        _contractFactoryMutex = new Mutex();
+        return true;
+    }
+
+    private void EnsureOpen() {
+        if (_disposed) throw new ObjectDisposedException("RestClient");
+    }
+
+    private HttpClient GetOpenHttpClient() {
+        _configurationMutex.Lock();
+        try {
+            EnsureOpen();
+            if (_httpClient == null) throw new ObjectDisposedException("RestClient");
+            return _httpClient;
+        } finally {
+            _configurationMutex.Unlock();
+        }
+    }
+
+    private void EnsureConfigurable() {
+        EnsureOpen();
+        if (_started) throw new InvalidOperationException(
+            "REST client configuration is frozen after the first request.");
+    }
+}

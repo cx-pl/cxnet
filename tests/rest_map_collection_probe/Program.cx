@@ -1,0 +1,579 @@
+import System;
+import System.Net.Http;
+import System.Net.Http.Rest;
+import System.Collections;
+import System.Data;
+import System.Threading.Tasks;
+
+namespace RestMapCollectionProbe;
+
+@Serializable
+public final class RestItem {
+    public string Name;
+    public int Quantity;
+
+    public constructor() {}
+}
+
+public interface IMapApi {
+    @Get("/numbers")
+    Task<const Dictionary<string, const List<int>>> GetNumbers();
+
+    @Get("/numbers-response")
+    Task<RestResponse<const Dictionary<string, const List<int>>>>
+        GetNumbersResponse();
+
+    @Get("/nullable-numbers")
+    Task<const Dictionary<string, const List<int>?>> GetNullableNumbers();
+
+    @Get("/nullable-numbers-response")
+    Task<RestResponse<const Dictionary<string, const List<int>?>>>
+        GetNullableNumbersResponse();
+
+    @Get("/nullable-elements-list")
+    Task<const Dictionary<string, const List<int?>>>
+        GetNullableListElements();
+
+    @Get("/nullable-elements-list-response")
+    Task<RestResponse<const Dictionary<string, const List<int?>>>>
+        GetNullableListElementsResponse();
+
+    @Get("/nullable-elements-array")
+    Task<const Dictionary<string, const Array<int?>>>
+        GetNullableArrayElements();
+
+    @Get("/nullable-elements-array-response")
+    Task<RestResponse<const Dictionary<string, const Array<int?>>>>
+        GetNullableArrayElementsResponse();
+
+    @Get("/nullable-elements-linked-list")
+    Task<const Dictionary<string, const LinkedList<int?>>>
+        GetNullableLinkedListElements();
+
+    @Get("/nullable-elements-linked-list-response")
+    Task<RestResponse<const Dictionary<string, const LinkedList<int?>>>>
+        GetNullableLinkedListElementsResponse();
+
+    @Get("/nullable-elements-queue")
+    Task<const Dictionary<string, const Queue<int?>>>
+        GetNullableQueueElements();
+
+    @Get("/nullable-elements-queue-response")
+    Task<RestResponse<const Dictionary<string, const Queue<int?>>>>
+        GetNullableQueueElementsResponse();
+
+    @Get("/nullable-elements-stack")
+    Task<const Dictionary<string, const Stack<int?>>>
+        GetNullableStackElements();
+
+    @Get("/nullable-elements-stack-response")
+    Task<RestResponse<const Dictionary<string, const Stack<int?>>>>
+        GetNullableStackElementsResponse();
+
+    @Get("/numbers-array")
+    Task<const Dictionary<string, const Array<int>>> GetNumberArrays();
+
+    @Get("/numbers-array-response")
+    Task<RestResponse<const Dictionary<string, const Array<int>>>>
+        GetNumberArraysResponse();
+
+    @Get("/numbers-linked-list")
+    Task<const Dictionary<string, const LinkedList<int>>> GetNumberLinkedLists();
+
+    @Get("/numbers-linked-list-response")
+    Task<RestResponse<const Dictionary<string, const LinkedList<int>>>>
+        GetNumberLinkedListsResponse();
+
+    @Get("/numbers-queue")
+    Task<const Dictionary<string, const Queue<int>>> GetNumberQueues();
+
+    @Get("/numbers-queue-response")
+    Task<RestResponse<const Dictionary<string, const Queue<int>>>>
+        GetNumberQueuesResponse();
+
+    @Get("/numbers-stack")
+    Task<const Dictionary<string, const Stack<int>>> GetNumberStacks();
+
+    @Get("/numbers-stack-response")
+    Task<RestResponse<const Dictionary<string, const Stack<int>>>>
+        GetNumberStacksResponse();
+
+    @Get("/unsigned-map")
+    Task<const Dictionary<string, ulong?>> GetUnsignedMap();
+
+    @Get("/unsigned-map-response")
+    Task<RestResponse<const Dictionary<string, ulong?>>>
+        GetUnsignedMapResponse();
+
+    @Get("/nullable-dto-map")
+    Task<const Dictionary<string, RestItem?>> GetNullableDtoMap();
+
+    @Get("/nullable-dto-map-response")
+    Task<RestResponse<const Dictionary<string, RestItem?>>>
+        GetNullableDtoMapResponse();
+}
+
+public static bool HasUnsignedMap(
+    const Dictionary<string, ulong?> values) {
+    if (values.Count != 3u) return false;
+    ulong? zero = values.GetValueOrDefault("zero");
+    ulong? maximum = values.GetValueOrDefault("maximum");
+    ulong? missing = values.GetValueOrDefault("missing");
+    return zero != null && (zero ?? 1ul) == 0ul &&
+        maximum != null &&
+        (maximum ?? 0ul) == 18446744073709551615ul && missing == null;
+}
+
+public static bool HasNullableDtoMap(
+    const Dictionary<string, RestItem?> values, int expectedQuantity) {
+    RestItem? item = values.GetValueOrDefault("item");
+    RestItem? missing = values.GetValueOrDefault("missing");
+    return values.Count == 2u && item != null &&
+        (item ?? new RestItem()).Name == "map item" &&
+        (item ?? new RestItem()).Quantity == expectedQuantity && missing == null;
+}
+
+public static bool HasIntSequence(IEnumerable<int> values,
+    int first, int second, int third) {
+    uint index = 0u;
+    foreach (int value in values) {
+        if (index == 0u && value != first) return false;
+        if (index == 1u && value != second) return false;
+        if (index == 2u && value != third) return false;
+        if (index > 2u) return false;
+        index += 1u;
+    }
+    return index == 3u;
+}
+
+public static bool HasListMap(
+    const Dictionary<string, const List<int>> values,
+    int first, int second, int third) {
+    const List<int> numbers = values.GetValueOrDefault("numbers");
+    const List<int> empty = values.GetValueOrDefault("empty");
+    List<int> emptyValues = empty ?? new List<int>();
+    return values.Count == 2u && numbers != null && empty != null &&
+        HasIntSequence(numbers, first, second, third) &&
+        emptyValues.Count == 0u;
+}
+
+public static bool HasNullableListMap(
+    const Dictionary<string, const List<int>?> values,
+    int first, int second, int third) {
+    const List<int>? numbers = values.GetValueOrDefault("numbers");
+    const List<int>? empty = values.GetValueOrDefault("empty");
+    const List<int>? missing = values.GetValueOrDefault("missing");
+    List<int> numberValues = numbers ?? new List<int>();
+    List<int> emptyValues = empty ?? new List<int>();
+    return values.Count == 3u && numbers != null && empty != null &&
+        missing == null && HasIntSequence(numberValues, first, second, third) &&
+        emptyValues.Count == 0u;
+}
+
+public static bool HasNullableIntSequence(IEnumerable<int?> values,
+    int first, int third) {
+    uint index = 0u;
+    foreach (int? value in values) {
+        if (index == 0u && (value == null || (value ?? 0) != first))
+            return false;
+        if (index == 1u && value != null) return false;
+        if (index == 2u && (value == null || (value ?? 0) != third))
+            return false;
+        if (index > 2u) return false;
+        index += 1u;
+    }
+    return index == 3u;
+}
+
+public static bool HasNullableListElementMap(
+    const Dictionary<string, const List<int?>> values,
+    int first, int third) {
+    const List<int?> numbers = values.GetValueOrDefault("numbers");
+    const List<int?> empty = values.GetValueOrDefault("empty");
+    List<int?> emptyValues = empty ?? new List<int?>();
+    return values.Count == 2u && numbers != null && empty != null &&
+        HasNullableIntSequence(numbers, first, third) &&
+        emptyValues.Count == 0u;
+}
+
+public static bool HasNullableArrayElementMap(
+    const Dictionary<string, const Array<int?>> values,
+    int first, int third) {
+    const Array<int?> numbers = values.GetValueOrDefault("numbers");
+    const Array<int?> empty = values.GetValueOrDefault("empty");
+    Array<int?> emptyValues = empty ?? new Array<int?>(0u);
+    return values.Count == 2u && numbers != null && empty != null &&
+        HasNullableIntSequence(numbers, first, third) &&
+        emptyValues.Count == 0u;
+}
+
+public static bool HasNullableLinkedListElementMap(
+    const Dictionary<string, const LinkedList<int?>> values,
+    int first, int third) {
+    const LinkedList<int?> numbers = values.GetValueOrDefault("numbers");
+    const LinkedList<int?> empty = values.GetValueOrDefault("empty");
+    LinkedList<int?> emptyValues = empty ?? new LinkedList<int?>();
+    return values.Count == 2u && numbers != null && empty != null &&
+        HasNullableIntSequence(numbers, first, third) &&
+        emptyValues.Count == 0u;
+}
+
+public static bool HasNullableQueueElementMap(
+    const Dictionary<string, const Queue<int?>> values,
+    int first, int third) {
+    const Queue<int?> numbers = values.GetValueOrDefault("numbers");
+    const Queue<int?> empty = values.GetValueOrDefault("empty");
+    Queue<int?> emptyValues = empty ?? new Queue<int?>();
+    return values.Count == 2u && numbers != null && empty != null &&
+        HasNullableIntSequence(numbers, first, third) &&
+        emptyValues.Count == 0u;
+}
+
+public static bool HasNullableStackElementMap(
+    const Dictionary<string, const Stack<int?>> values,
+    int first, int third) {
+    const Stack<int?> numbers = values.GetValueOrDefault("numbers");
+    const Stack<int?> empty = values.GetValueOrDefault("empty");
+    Stack<int?> emptyValues = empty ?? new Stack<int?>();
+    return values.Count == 2u && numbers != null && empty != null &&
+        HasNullableIntSequence(numbers, first, third) &&
+        emptyValues.Count == 0u;
+}
+
+public static bool HasArrayMap(
+    const Dictionary<string, const Array<int>> values,
+    int first, int second, int third) {
+    const Array<int> numbers = values.GetValueOrDefault("numbers");
+    const Array<int> empty = values.GetValueOrDefault("empty");
+    Array<int> emptyValues = empty ?? new Array<int>(0u);
+    return values.Count == 2u && numbers != null && empty != null &&
+        HasIntSequence(numbers, first, second, third) &&
+        emptyValues.Count == 0u;
+}
+
+public static bool HasLinkedListMap(
+    const Dictionary<string, const LinkedList<int>> values,
+    int first, int second, int third) {
+    const LinkedList<int> numbers = values.GetValueOrDefault("numbers");
+    const LinkedList<int> empty = values.GetValueOrDefault("empty");
+    LinkedList<int> emptyValues = empty ?? new LinkedList<int>();
+    return values.Count == 2u && numbers != null && empty != null &&
+        HasIntSequence(numbers, first, second, third) &&
+        emptyValues.Count == 0u;
+}
+
+public static bool HasQueueMap(
+    const Dictionary<string, const Queue<int>> values,
+    int first, int second, int third) {
+    const Queue<int> numbers = values.GetValueOrDefault("numbers");
+    const Queue<int> empty = values.GetValueOrDefault("empty");
+    Queue<int> emptyValues = empty ?? new Queue<int>();
+    return values.Count == 2u && numbers != null && empty != null &&
+        HasIntSequence(numbers, first, second, third) &&
+        emptyValues.Count == 0u;
+}
+
+public static bool HasStackMap(
+    const Dictionary<string, const Stack<int>> values,
+    int first, int second, int third) {
+    const Stack<int> numbers = values.GetValueOrDefault("numbers");
+    const Stack<int> empty = values.GetValueOrDefault("empty");
+    Stack<int> emptyValues = empty ?? new Stack<int>();
+    return values.Count == 2u && numbers != null && empty != null &&
+        HasIntSequence(numbers, first, second, third) &&
+        emptyValues.Count == 0u;
+}
+
+public static int Main(string[] args) {
+    if (args.Length != 1u) return 2;
+    RestClient client = RestClient.For<IMapApi>();
+    client.BaseAddress = new Uri(args[0u]);
+    IMapApi api = client.GetContract<IMapApi>();
+    try {
+        Task<const Dictionary<string, const List<int>>> listPending =
+            api.GetNumbers();
+        TaskScheduler.RunUntil(listPending);
+        if (!listPending.IsCompleted ||
+            !HasListMap(listPending.GetResult(), 3, 1, 4)) return 5;
+        Task<RestResponse<const Dictionary<string, const List<int>>>>
+            listResponsePending = api.GetNumbersResponse();
+        TaskScheduler.RunUntil(listResponsePending);
+        RestResponse<const Dictionary<string, const List<int>>> listResponse =
+            listResponsePending.GetResult();
+        if (!listResponse.HasValue ||
+            listResponse.StatusCode != HttpStatusCode.Accepted ||
+            listResponse.Headers.GetFirstValue("X-Fixture") != "list-map" ||
+            !HasListMap(listResponse.GetValue(), 2, 7, 1)) {
+            listResponse.Dispose();
+            return 6;
+        }
+        listResponse.Dispose();
+
+        Task<const Dictionary<string, const List<int>?>> nullableListPending =
+            api.GetNullableNumbers();
+        TaskScheduler.RunUntil(nullableListPending);
+        if (!nullableListPending.IsCompleted ||
+            !HasNullableListMap(nullableListPending.GetResult(), 5, 8, 13))
+            return 15;
+        Task<RestResponse<const Dictionary<string, const List<int>?>>>
+            nullableListResponsePending = api.GetNullableNumbersResponse();
+        TaskScheduler.RunUntil(nullableListResponsePending);
+        RestResponse<const Dictionary<string, const List<int>?>>
+            nullableListResponse = nullableListResponsePending.GetResult();
+        if (!nullableListResponse.HasValue ||
+            nullableListResponse.StatusCode != HttpStatusCode.Accepted ||
+            nullableListResponse.Headers.GetFirstValue("X-Fixture") !=
+                "nullable-list-map" ||
+            !HasNullableListMap(nullableListResponse.GetValue(), 1, 2, 3)) {
+            nullableListResponse.Dispose();
+            return 16;
+        }
+        nullableListResponse.Dispose();
+
+        Task<const Dictionary<string, const List<int?>>> nullableElementsListPending =
+            api.GetNullableListElements();
+        TaskScheduler.RunUntil(nullableElementsListPending);
+        if (!nullableElementsListPending.IsCompleted ||
+            !HasNullableListElementMap(
+                nullableElementsListPending.GetResult(), 5, 8)) return 17;
+        Task<RestResponse<const Dictionary<string, const List<int?>>>>
+            nullableElementsListResponsePending =
+                api.GetNullableListElementsResponse();
+        TaskScheduler.RunUntil(nullableElementsListResponsePending);
+        RestResponse<const Dictionary<string, const List<int?>>>
+            nullableElementsListResponse =
+                nullableElementsListResponsePending.GetResult();
+        if (!nullableElementsListResponse.HasValue ||
+            nullableElementsListResponse.StatusCode !=
+                HttpStatusCode.Accepted ||
+            nullableElementsListResponse.Headers.GetFirstValue("X-Fixture") !=
+                "nullable-list-elements-map" ||
+            !HasNullableListElementMap(
+                nullableElementsListResponse.GetValue(), 1, 3)) {
+            nullableElementsListResponse.Dispose();
+            return 18;
+        }
+        nullableElementsListResponse.Dispose();
+
+        Task<const Dictionary<string, const Array<int?>>> nullableElementsArrayPending =
+            api.GetNullableArrayElements();
+        TaskScheduler.RunUntil(nullableElementsArrayPending);
+        if (!nullableElementsArrayPending.IsCompleted ||
+            !HasNullableArrayElementMap(
+                nullableElementsArrayPending.GetResult(), 5, 8)) return 19;
+        Task<RestResponse<const Dictionary<string, const Array<int?>>>>
+            nullableElementsArrayResponsePending =
+                api.GetNullableArrayElementsResponse();
+        TaskScheduler.RunUntil(nullableElementsArrayResponsePending);
+        RestResponse<const Dictionary<string, const Array<int?>>>
+            nullableElementsArrayResponse =
+                nullableElementsArrayResponsePending.GetResult();
+        if (!nullableElementsArrayResponse.HasValue ||
+            nullableElementsArrayResponse.StatusCode !=
+                HttpStatusCode.Accepted ||
+            nullableElementsArrayResponse.Headers.GetFirstValue("X-Fixture") !=
+                "nullable-array-elements-map" ||
+            !HasNullableArrayElementMap(
+                nullableElementsArrayResponse.GetValue(), 1, 3)) {
+            nullableElementsArrayResponse.Dispose();
+            return 20;
+        }
+        nullableElementsArrayResponse.Dispose();
+
+        Task<const Dictionary<string, const LinkedList<int?>>>
+            nullableElementsLinkedListPending =
+                api.GetNullableLinkedListElements();
+        TaskScheduler.RunUntil(nullableElementsLinkedListPending);
+        if (!nullableElementsLinkedListPending.IsCompleted ||
+            !HasNullableLinkedListElementMap(
+                nullableElementsLinkedListPending.GetResult(), 5, 8)) return 21;
+        Task<RestResponse<const Dictionary<string, const LinkedList<int?>>>>
+            nullableElementsLinkedListResponsePending =
+                api.GetNullableLinkedListElementsResponse();
+        TaskScheduler.RunUntil(nullableElementsLinkedListResponsePending);
+        RestResponse<const Dictionary<string, const LinkedList<int?>>>
+            nullableElementsLinkedListResponse =
+                nullableElementsLinkedListResponsePending.GetResult();
+        if (!nullableElementsLinkedListResponse.HasValue ||
+            nullableElementsLinkedListResponse.StatusCode !=
+                HttpStatusCode.Accepted ||
+            nullableElementsLinkedListResponse.Headers.GetFirstValue(
+                "X-Fixture") != "nullable-linked-list-elements-map" ||
+            !HasNullableLinkedListElementMap(
+                nullableElementsLinkedListResponse.GetValue(), 1, 3)) {
+            nullableElementsLinkedListResponse.Dispose();
+            return 22;
+        }
+        nullableElementsLinkedListResponse.Dispose();
+
+        Task<const Dictionary<string, const Queue<int?>>>
+            nullableElementsQueuePending = api.GetNullableQueueElements();
+        TaskScheduler.RunUntil(nullableElementsQueuePending);
+        if (!nullableElementsQueuePending.IsCompleted ||
+            !HasNullableQueueElementMap(
+                nullableElementsQueuePending.GetResult(), 5, 8)) return 23;
+        Task<RestResponse<const Dictionary<string, const Queue<int?>>>>
+            nullableElementsQueueResponsePending =
+                api.GetNullableQueueElementsResponse();
+        TaskScheduler.RunUntil(nullableElementsQueueResponsePending);
+        RestResponse<const Dictionary<string, const Queue<int?>>>
+            nullableElementsQueueResponse =
+                nullableElementsQueueResponsePending.GetResult();
+        if (!nullableElementsQueueResponse.HasValue ||
+            nullableElementsQueueResponse.StatusCode !=
+                HttpStatusCode.Accepted ||
+            nullableElementsQueueResponse.Headers.GetFirstValue("X-Fixture") !=
+                "nullable-queue-elements-map" ||
+            !HasNullableQueueElementMap(
+                nullableElementsQueueResponse.GetValue(), 1, 3)) {
+            nullableElementsQueueResponse.Dispose();
+            return 24;
+        }
+        nullableElementsQueueResponse.Dispose();
+
+        Task<const Dictionary<string, const Stack<int?>>>
+            nullableElementsStackPending = api.GetNullableStackElements();
+        TaskScheduler.RunUntil(nullableElementsStackPending);
+        if (!nullableElementsStackPending.IsCompleted ||
+            !HasNullableStackElementMap(
+                nullableElementsStackPending.GetResult(), 5, 8)) return 25;
+        Task<RestResponse<const Dictionary<string, const Stack<int?>>>>
+            nullableElementsStackResponsePending =
+                api.GetNullableStackElementsResponse();
+        TaskScheduler.RunUntil(nullableElementsStackResponsePending);
+        RestResponse<const Dictionary<string, const Stack<int?>>>
+            nullableElementsStackResponse =
+                nullableElementsStackResponsePending.GetResult();
+        if (!nullableElementsStackResponse.HasValue ||
+            nullableElementsStackResponse.StatusCode !=
+                HttpStatusCode.Accepted ||
+            nullableElementsStackResponse.Headers.GetFirstValue("X-Fixture") !=
+                "nullable-stack-elements-map" ||
+            !HasNullableStackElementMap(
+                nullableElementsStackResponse.GetValue(), 1, 3)) {
+            nullableElementsStackResponse.Dispose();
+            return 26;
+        }
+        nullableElementsStackResponse.Dispose();
+
+        Task<const Dictionary<string, const Array<int>>> arrayPending =
+            api.GetNumberArrays();
+        TaskScheduler.RunUntil(arrayPending);
+        if (!arrayPending.IsCompleted ||
+            !HasArrayMap(arrayPending.GetResult(), 3, 1, 4)) return 7;
+        Task<RestResponse<const Dictionary<string, const Array<int>>>>
+            arrayResponsePending = api.GetNumberArraysResponse();
+        TaskScheduler.RunUntil(arrayResponsePending);
+        RestResponse<const Dictionary<string, const Array<int>>> arrayResponse =
+            arrayResponsePending.GetResult();
+        if (!arrayResponse.HasValue ||
+            arrayResponse.StatusCode != HttpStatusCode.Accepted ||
+            arrayResponse.Headers.GetFirstValue("X-Fixture") != "array-map" ||
+            !HasArrayMap(arrayResponse.GetValue(), 2, 7, 1)) {
+            arrayResponse.Dispose();
+            return 8;
+        }
+        arrayResponse.Dispose();
+
+        Task<const Dictionary<string, const LinkedList<int>>>
+            linkedListPending = api.GetNumberLinkedLists();
+        TaskScheduler.RunUntil(linkedListPending);
+        if (!linkedListPending.IsCompleted ||
+            !HasLinkedListMap(linkedListPending.GetResult(), 3, 1, 4)) return 9;
+        Task<RestResponse<const Dictionary<string, const LinkedList<int>>>>
+            linkedListResponsePending = api.GetNumberLinkedListsResponse();
+        TaskScheduler.RunUntil(linkedListResponsePending);
+        RestResponse<const Dictionary<string, const LinkedList<int>>>
+            linkedListResponse = linkedListResponsePending.GetResult();
+        if (!linkedListResponse.HasValue ||
+            linkedListResponse.StatusCode != HttpStatusCode.Accepted ||
+            linkedListResponse.Headers.GetFirstValue("X-Fixture") !=
+                "linked-list-map" ||
+            !HasLinkedListMap(linkedListResponse.GetValue(), 2, 7, 1)) {
+            linkedListResponse.Dispose();
+            return 10;
+        }
+        linkedListResponse.Dispose();
+
+        Task<const Dictionary<string, const Queue<int>>> queuePending =
+            api.GetNumberQueues();
+        TaskScheduler.RunUntil(queuePending);
+        if (!queuePending.IsCompleted ||
+            !HasQueueMap(queuePending.GetResult(), 3, 1, 4)) return 11;
+        Task<RestResponse<const Dictionary<string, const Queue<int>>>>
+            queueResponsePending = api.GetNumberQueuesResponse();
+        TaskScheduler.RunUntil(queueResponsePending);
+        RestResponse<const Dictionary<string, const Queue<int>>> queueResponse =
+            queueResponsePending.GetResult();
+        if (!queueResponse.HasValue ||
+            queueResponse.StatusCode != HttpStatusCode.Accepted ||
+            queueResponse.Headers.GetFirstValue("X-Fixture") != "queue-map" ||
+            !HasQueueMap(queueResponse.GetValue(), 2, 7, 1)) {
+            queueResponse.Dispose();
+            return 12;
+        }
+        queueResponse.Dispose();
+
+        Task<const Dictionary<string, const Stack<int>>> stackPending =
+            api.GetNumberStacks();
+        TaskScheduler.RunUntil(stackPending);
+        if (!stackPending.IsCompleted ||
+            !HasStackMap(stackPending.GetResult(), 3, 1, 4)) return 13;
+        Task<RestResponse<const Dictionary<string, const Stack<int>>>>
+            stackResponsePending = api.GetNumberStacksResponse();
+        TaskScheduler.RunUntil(stackResponsePending);
+        RestResponse<const Dictionary<string, const Stack<int>>> stackResponse =
+            stackResponsePending.GetResult();
+        if (!stackResponse.HasValue ||
+            stackResponse.StatusCode != HttpStatusCode.Accepted ||
+            stackResponse.Headers.GetFirstValue("X-Fixture") != "stack-map" ||
+            !HasStackMap(stackResponse.GetValue(), 2, 7, 1)) {
+            stackResponse.Dispose();
+            return 14;
+        }
+        stackResponse.Dispose();
+
+        Task<const Dictionary<string, ulong?>> directPending =
+            api.GetUnsignedMap();
+        TaskScheduler.RunUntil(directPending);
+        if (!HasUnsignedMap(directPending.GetResult())) return 3;
+
+        Task<RestResponse<const Dictionary<string, ulong?>>> wrappedPending =
+            api.GetUnsignedMapResponse();
+        TaskScheduler.RunUntil(wrappedPending);
+        RestResponse<const Dictionary<string, ulong?>> wrapped =
+            wrappedPending.GetResult();
+        if (!wrapped.HasValue ||
+            wrapped.StatusCode != HttpStatusCode.Accepted ||
+            wrapped.Headers.GetFirstValue("X-Fixture") != "unsigned-map" ||
+            !HasUnsignedMap(wrapped.GetValue())) {
+            wrapped.Dispose();
+            return 4;
+        }
+
+        Task<const Dictionary<string, RestItem?>> nullableDtoMapPending =
+            api.GetNullableDtoMap();
+        TaskScheduler.RunUntil(nullableDtoMapPending);
+        if (!nullableDtoMapPending.IsCompleted ||
+            !HasNullableDtoMap(nullableDtoMapPending.GetResult(), 11)) return 15;
+
+        Task<RestResponse<const Dictionary<string, RestItem?>>>
+            nullableDtoMapResponsePending = api.GetNullableDtoMapResponse();
+        TaskScheduler.RunUntil(nullableDtoMapResponsePending);
+        RestResponse<const Dictionary<string, RestItem?>> nullableDtoMapResponse =
+            nullableDtoMapResponsePending.GetResult();
+        if (!nullableDtoMapResponse.HasValue ||
+            nullableDtoMapResponse.StatusCode != HttpStatusCode.Accepted ||
+            nullableDtoMapResponse.Headers.GetFirstValue("X-Fixture") !=
+                "nullable-dto-map" ||
+            !HasNullableDtoMap(nullableDtoMapResponse.GetValue(), 23)) {
+            nullableDtoMapResponse.Dispose();
+            return 16;
+        }
+        nullableDtoMapResponse.Dispose();
+        wrapped.Dispose();
+    } finally {
+        client.Dispose();
+    }
+    return 0;
+}
